@@ -146,7 +146,7 @@ void DSP56362Emulator::startThread()
             if (m_thrStop.load(std::memory_order_acquire)) break;
             // idle: spin a little (the next chunk is usually ~20 us of MCU time away), then sleep until posted
             bool got = false;
-            for (int i = 0; i < 400 && !got; ++i) { _mm_pause(); got = m_qHead.load(std::memory_order_acquire) != d; }
+            for (int i = 0; i < 400 && !got; ++i) { MS2K_CPU_RELAX(); got = m_qHead.load(std::memory_order_acquire) != d; }
             if (got) continue;
             std::unique_lock<std::mutex> l(m_thrMx);
             m_thrSleeping.store(true, std::memory_order_release);
@@ -508,6 +508,10 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
 
     for (TWord i = 0; i < 192; ++i)
         m_mem->set(MemArea_P, 0xFF0000 + i, rom[4*i] | (rom[4*i+1] << 8) | (rom[4*i+2] << 16));
+    // MAC-1: tell the JIT, as DSP::memWriteP does. On macOS the library's MmuArray has no
+    // virtual-memory backing and its block table only grows on a P write it hears of - without
+    // this the first jump to $FF0000 indexes an empty table.
+    m_dsp->getJit().notifyProgramMemWrite(0xFF0000 + 191);
 
     // RESET deasserts: MODA-MODD latched into OMR[3:0] (DSP56362/D Table 1-8), mode 5 per
     // KOD-A30412, and execution begins at the mode's reset vector $FF0000 (UM Table 4-1).

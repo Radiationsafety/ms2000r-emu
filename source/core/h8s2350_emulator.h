@@ -19,7 +19,10 @@
 #include <mutex>          // BUG108: MIDI IN from the host thread
 #include <deque>
 #include <atomic>         // GUI-2: panel switches from the GUI thread
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>  // Add SIMD support
+#define MS2K_HAVE_AVX2 1   // MAC-1: arm64 builds take the scalar paths
+#endif
 #include "h8s2350_memory_map.h"
 #include "h8s2350_interrupt_system.h"
 #include "h8s2350_peripherals.h"
@@ -191,16 +194,10 @@ public:
         size_t size = end_addr - start_addr;
         m_hot_memory_pool.resize(size);
         
-        // Initialize with SIMD operations
-        __m256i pattern = _mm256_set_epi8(0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
-                                         0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
-                                         0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
-                                         0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00);
-        
-        for (size_t i = 0; i < size; i += 32) {
-            if (i + 32 <= size) {
-                _mm256_store_si256((__m256i*)(&m_hot_memory_pool[i]), pattern);
-            }
+        // The 0x00..0x0F byte pattern, in whole 32-byte blocks (MAC-1: scalar, same bytes as the
+        // former _mm256_set_epi8 store)
+        for (size_t i = 0, end = size & ~size_t(31); i < end; ++i) {
+            m_hot_memory_pool[i] = uint8_t(i & 0x0F);
         }
     }
     
@@ -213,10 +210,12 @@ public:
         return m_hot_memory_pool[address - m_start_address];
     }
     
+#ifdef MS2K_HAVE_AVX2
     __forceinline __m256i getHotMemoryVector(uint32_t address) {
         m_simd_executions++;
         return _mm256_load_si256((__m256i*)(&m_hot_memory_pool[address - m_start_address]));
     }
+#endif
     
     // Statistics
     uint64_t getHotMemoryAccesses() const { return m_hot_memory_accesses; }

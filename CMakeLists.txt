@@ -57,8 +57,17 @@ if(NOT MSVC)
     add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/source/core/platform_compat.h)
     # The sources use 256-bit AVX/AVX2 intrinsics (h8s2350_emulator.h, h8s2350_simd_optimizations).
     # MSVC emits them without a switch; GCC/Clang need the target enabled. Same CPU requirement as
-    # the Windows build.
-    add_compile_options(-mavx2)
+    # the Windows build. MAC-1: arm64 (Apple Silicon) takes the scalar paths instead.
+    # On macOS the target is CMAKE_OSX_ARCHITECTURES when set (an x86_64 build on Apple Silicon runs
+    # under Rosetta 2), else the host.
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(MS2K_TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(MS2K_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    if(MS2K_TARGET_ARCH MATCHES "x86_64|AMD64|i[3-6]86")
+        add_compile_options(-mavx2)
+    endif()
 endif()
 
 # Include directories
@@ -196,6 +205,17 @@ if(MSVC)
     target_compile_options(ms2000 PRIVATE $<$<CONFIG:Release>:/GL /GS->)
     set_property(TARGET ms2000 APPEND PROPERTY STATIC_LIBRARY_OPTIONS $<$<CONFIG:Release>:/LTCG>)
     target_link_options(ms2000 INTERFACE $<$<CONFIG:Release>:/LTCG>)
+elseif(APPLE)
+    # MAC-1: the same for Apple Clang - ThinLTO across the core and the executables linking it.
+    # -mcpu=apple-m1 is the oldest Apple Silicon core, so the binary runs on every M-series Mac.
+    option(MS2K_MAC_LTO "ThinLTO for the macOS Release build" ON)
+    if(MS2K_MAC_LTO)
+        target_compile_options(ms2000 PUBLIC $<$<CONFIG:Release>:-flto=thin>)
+        target_link_options(ms2000 INTERFACE $<$<CONFIG:Release>:-flto=thin>)
+    endif()
+    if(MS2K_TARGET_ARCH MATCHES "arm64|aarch64")
+        target_compile_options(ms2000 PUBLIC -mcpu=apple-m1)
+    endif()
 endif()
 
 # MS2000 library properties
