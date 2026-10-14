@@ -43,18 +43,37 @@ private:
     std::string m_err;
 };
 
-// AUHAL capture (AUDIO-IN): 48 kHz stereo float frames, handed on as they arrive. MAC-2: not yet implemented on
-// macOS - list() is empty and open() fails, so the inputs stay silent.
+// AUHAL capture (AUDIO-IN): 48 kHz stereo float frames, handed on as they arrive. MAC-4: a device with more than two
+// inputs is listed as stereo pairs ("UMC1820 - IN 3-4"), as Windows lists such an interface's endpoints; a one-input
+// device feeds both sides. A device not running at 48 kHz is converted (AudioConverter) - AUHAL does not resample
+// its input. Recording needs the microphone permission (System Settings > Privacy & Security > Microphone).
 class HostAudioIn {
 public:
     using Sink = std::function<void(const float* lr, uint32_t frames)>;
-    static std::vector<HostDevice> list() { return {}; }
-    bool open(const std::wstring&, Sink) { return false; }
-    void close() {}
-    bool isOpen() const { return false; }
-    std::string lastError() const { return "audio input is not implemented on macOS yet"; }
-    uint64_t frames() const { return 0; }
-    bool dead() const { return false; }
+    static std::vector<HostDevice> list();            // input devices / stereo pairs, the default device first
+    bool open(const std::wstring& deviceId, Sink sink);
+    void close();
+    bool isOpen() const { return m_unit != nullptr; }
+    std::string lastError() const { std::lock_guard<std::mutex> l(m_errMx); return m_err; }
+    uint64_t frames() const { return m_frames; }
+    bool dead() const { return m_dead.load(); }
+    ~HostAudioIn() { close(); }
+    // called from the CoreAudio IO thread
+    void input(void* flags, const void* timeStamp, uint32_t frames);
+    bool pullDevice(float*& data, uint32_t& frames);  // the AudioConverter's input: the frames just captured
+private:
+    void fail(const std::string& e) { std::lock_guard<std::mutex> l(m_errMx); m_err = e; }
+    Sink m_sink;
+    void* m_unit = nullptr;                            // AudioComponentInstance
+    void* m_conv = nullptr;                            // AudioConverterRef, when the device is not at 48 kHz
+    double m_devRate = 48000.0;
+    std::vector<float> m_dev, m_out;                   // device-rate frames, 48 kHz frames (interleaved stereo)
+    uint32_t m_devFrames = 0;
+    bool m_devTaken = false;
+    std::atomic<bool> m_dead{false};
+    std::atomic<uint64_t> m_frames{0};
+    mutable std::mutex m_errMx;
+    std::string m_err;
 };
 
 // CoreMIDI IN. Short messages and SysEx are handed on as raw bytes, in order.

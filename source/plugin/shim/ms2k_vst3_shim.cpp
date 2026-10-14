@@ -14,7 +14,19 @@
 //  - an edit controller goes to the copy whose component was created last and has no controller yet - JUCE's
 //    component and controller find each other through a raw pointer, so they must live in the same copy.
 // Copies stay loaded until ExitDll (a released instance's copy is reused by the next one).
+//
+// MAC-4 (macOS): the same scheme on a VST3 bundle - the host loads Contents/MacOS/MS2000R (this module), the JUCE
+// plugin is Contents/Resources/MS2000R_engine, further copies go to $TMPDIR/MS2000R_engines and are dlopen()ed (a
+// different file is a different image: its own statics, its own JUCE). bundleEntry/bundleExit stand for
+// InitDll/ExitDll. Everything below the platform section is shared.
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <filesystem>
+#endif
 #include <atomic>
 #include <cstring>
 #include <cwchar>
@@ -36,12 +48,21 @@ typedef IPluginFactory* (PLUGIN_API* GetFactoryProc)();
 typedef bool (*InitExitProc)();
 typedef int (*LiveProc)();
 
+// ---------------------------------------------------------------- platform
+#ifdef _WIN32
+using ModuleHandle = HMODULE;
+using PathStr = std::wstring;
+#else
+using ModuleHandle = void*;
+using PathStr = std::string;
+#endif
+
 struct EngineCopy {
-    HMODULE module = nullptr;
+    ModuleHandle module = nullptr;
     IPluginFactory* factory = nullptr;
     IPluginFactory3* factory3 = nullptr;
     LiveProc live = nullptr;
-    std::wstring path;
+    PathStr path;
     bool temporary = false;
     uint64_t compSerial = 0;   // creation sequence number of the last component made here
     uint64_t ctrlSerial = 0;   // ... and of the last controller
@@ -52,6 +73,7 @@ std::deque<EngineCopy> g_copies;   // a deque: pointers to its elements survive 
 uint64_t g_serial = 0;
 FUnknown* g_hostContext = nullptr;
 
+#ifdef _WIN32
 std::wstring modulePath()
 {
     HMODULE self = nullptr;
@@ -91,17 +113,81 @@ void cleanStaleCopies()
     FindClose(h);
 }
 
+void* symbol(ModuleHandle m, const char* name) { return reinterpret_cast<void*>(GetProcAddress(m, name)); }
+void closeModule(ModuleHandle m) { FreeLibrary(m); }
+void deleteFile(const PathStr& p) { DeleteFileW(p.c_str()); }
+bool callInit(ModuleHandle m) { auto init = reinterpret_cast<InitExitProc>(symbol(m, "InitDll")); return !init || init(); }
+void callExit(ModuleHandle m) { if (auto exitDll = reinterpret_cast<InitExitProc>(symbol(m, "ExitDll"))) exitDll(); }
+ModuleHandle openModule(const PathStr& p) { return LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH); }
+void setBinaryEnv(const PathStr& self)
+{
+    SetEnvironmentVariableW(L"MS2K_PLUGIN_BINARY", self.c_str());
+    _wputenv_s(L"MS2K_PLUGIN_BINARY", self.c_str());
+}
+PathStr copyPath(unsigned n) { return tempDir() + L"\\engine_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(n) + L".dll"; }
+bool copyEngine(const PathStr& from, const PathStr& to) { return CopyFileW(from.c_str(), to.c_str(), FALSE) != 0; }
+#else
+CFBundleRef g_bundle = nullptr;   // this module's bundle, from bundleEntry - handed to every engine copy
+
+PathStr modulePath()
+{
+    Dl_info info{};
+    return dladdr(reinterpret_cast<const void*>(&modulePath), &info) && info.dli_fname ? PathStr(info.dli_fname) : PathStr();
+}
+
+PathStr parentDir(const PathStr& p)
+{
+    const auto i = p.find_last_of('/');
+    return i == PathStr::npos ? PathStr() : p.substr(0, i);
+}
+
+// <bundle>/Contents/MacOS/MS2000R -> <bundle>/Contents/Resources/MS2000R_engine
+PathStr enginePath() { return parentDir(parentDir(modulePath())) + "/Resources/MS2000R_engine"; }
+
+PathStr tempDir()
+{
+    const char* t = std::getenv("TMPDIR");
+    PathStr d = PathStr(t && *t ? t : "/tmp/");
+    if (d.back() != '/') d += '/';
+    d += "MS2000R_engines";
+    std::error_code ec; std::filesystem::create_directories(d, ec);
+    return d;
+}
+
+// copies left behind by a host that did not call bundleExit
+void cleanStaleCopies()
+{
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(tempDir(), ec))
+        if (e.path().filename().string().rfind("engine_", 0) == 0) std::filesystem::remove(e.path(), ec);
+}
+
+void* symbol(ModuleHandle m, const char* name) { return dlsym(m, name); }
+void closeModule(ModuleHandle m) { dlclose(m); }
+void deleteFile(const PathStr& p) { std::error_code ec; std::filesystem::remove(p, ec); }
+typedef bool (*BundleEntryProc)(CFBundleRef);
+bool callInit(ModuleHandle m) { auto f = reinterpret_cast<BundleEntryProc>(symbol(m, "bundleEntry")); return !f || f(g_bundle); }
+void callExit(ModuleHandle m) { if (auto f = reinterpret_cast<InitExitProc>(symbol(m, "bundleExit"))) f(); }
+ModuleHandle openModule(const PathStr& p) { return dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL); }
+void setBinaryEnv(const PathStr& self) { setenv("MS2K_PLUGIN_BINARY", self.c_str(), 1); }
+PathStr copyPath(unsigned n) { return tempDir() + "/engine_" + std::to_string(getpid()) + "_" + std::to_string(n); }
+bool copyEngine(const PathStr& from, const PathStr& to)
+{
+    std::error_code ec;
+    return std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+}
+#endif
+
+// ---------------------------------------------------------------- shared
 bool loadCopy(EngineCopy& c)
 {
-    c.module = LoadLibraryExW(c.path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    c.module = openModule(c.path);
     if (!c.module) return false;
-    if (auto init = reinterpret_cast<InitExitProc>(GetProcAddress(c.module, "InitDll")); init && !init()) {
-        FreeLibrary(c.module); c.module = nullptr; return false;
-    }
-    auto get = reinterpret_cast<GetFactoryProc>(GetProcAddress(c.module, "GetPluginFactory"));
-    c.live = reinterpret_cast<LiveProc>(GetProcAddress(c.module, "ms2k_liveProcessors"));
+    if (!callInit(c.module)) { closeModule(c.module); c.module = nullptr; return false; }
+    auto get = reinterpret_cast<GetFactoryProc>(symbol(c.module, "GetPluginFactory"));
+    c.live = reinterpret_cast<LiveProc>(symbol(c.module, "ms2k_liveProcessors"));
     c.factory = get ? get() : nullptr;
-    if (!c.factory) { FreeLibrary(c.module); c.module = nullptr; return false; }
+    if (!c.factory) { closeModule(c.module); c.module = nullptr; return false; }
     void* f3 = nullptr;
     if (c.factory->queryInterface(IPluginFactory3::iid, &f3) == kResultOk) c.factory3 = static_cast<IPluginFactory3*>(f3);
     if (c.factory3 && g_hostContext) c.factory3->setHostContext(g_hostContext);
@@ -113,8 +199,7 @@ EngineCopy* first()   // the engine file in the bundle; it also answers every cl
     if (!g_copies.empty()) return g_copies[0].module ? &g_copies[0] : nullptr;
     // the engine finds the MS2000 folder above the plugin binary (PUBLIC-1); a copy in %TEMP% must look above this file
     const auto self = modulePath();
-    SetEnvironmentVariableW(L"MS2K_PLUGIN_BINARY", self.c_str());
-    _wputenv_s(L"MS2K_PLUGIN_BINARY", self.c_str());
+    setBinaryEnv(self);
     cleanStaleCopies();
     EngineCopy c;
     c.path = enginePath();
@@ -127,11 +212,11 @@ EngineCopy* newCopy()
 {
     static std::atomic<unsigned> counter{ 0 };
     EngineCopy c;
-    c.path = tempDir() + L"\\engine_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(++counter) + L".dll";
+    c.path = copyPath(++counter);
     c.temporary = true;
-    if (!CopyFileW(g_copies[0].path.c_str(), c.path.c_str(), FALSE)) return nullptr;
+    if (!copyEngine(g_copies[0].path, c.path)) return nullptr;
     g_copies.push_back(c);
-    if (!loadCopy(g_copies.back())) { DeleteFileW(c.path.c_str()); g_copies.pop_back(); return nullptr; }
+    if (!loadCopy(g_copies.back())) { deleteFile(c.path); g_copies.pop_back(); return nullptr; }
     return &g_copies.back();
 }
 
@@ -214,25 +299,39 @@ ShimFactory g_factory;
 
 } // namespace
 
+#ifdef _WIN32
+#define MS2K_EXPORT __declspec(dllexport)
+#else
+#define MS2K_EXPORT __attribute__((visibility("default")))
+#endif
+
+namespace {
+bool unloadAll()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    for (auto it = g_copies.rbegin(); it != g_copies.rend(); ++it) {
+        if (!it->module) continue;
+        callExit(it->module);
+        closeModule(it->module);
+        if (it->temporary) deleteFile(it->path);
+    }
+    g_copies.clear();
+    return true;
+}
+} // namespace
+
 extern "C" {
-__declspec(dllexport) IPluginFactory* PLUGIN_API GetPluginFactory()
+MS2K_EXPORT IPluginFactory* PLUGIN_API GetPluginFactory()
 {
     g_factory.addRef();
     return &g_factory;
 }
 
-__declspec(dllexport) bool InitDll() { return true; }
-
-__declspec(dllexport) bool ExitDll()
-{
-    std::lock_guard<std::mutex> l(g_lock);
-    for (auto it = g_copies.rbegin(); it != g_copies.rend(); ++it) {
-        if (!it->module) continue;
-        if (auto exitDll = reinterpret_cast<InitExitProc>(GetProcAddress(it->module, "ExitDll"))) exitDll();
-        FreeLibrary(it->module);
-        if (it->temporary) DeleteFileW(it->path.c_str());
-    }
-    g_copies.clear();
-    return true;
-}
+#ifdef _WIN32
+MS2K_EXPORT bool InitDll() { return true; }
+MS2K_EXPORT bool ExitDll() { return unloadAll(); }
+#else
+MS2K_EXPORT bool bundleEntry(CFBundleRef ref) { if (ref && !g_bundle) { CFRetain(ref); g_bundle = ref; } return true; }
+MS2K_EXPORT bool bundleExit() { const bool r = unloadAll(); if (g_bundle) { CFRelease(g_bundle); g_bundle = nullptr; } return r; }
+#endif
 }

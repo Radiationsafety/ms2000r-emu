@@ -10,6 +10,16 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(KorgMS2000 VERSION 0.9.7 LANGUAGES CXX)
+
+# MAC-4: a plugin lives in a host that has its own JUCE (or its own anything), and macOS coalesces every exported
+# weak symbol across the loaded images - the host's and the plugin's JUCE then ran each other's inline code (measured:
+# a ValueTree freed with the wrong allocator in getStateInformation). Nothing but the entry points is exported.
+if(APPLE)
+    set(CMAKE_C_VISIBILITY_PRESET hidden)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+endif()
 add_compile_definitions(MS2K_VERSION="${PROJECT_VERSION}")   # PUBLIC-1b: shown in the GUI title and the plugin
 
 # Enable testing support for CTest
@@ -316,6 +326,7 @@ elseif(APPLE)
             COMMAND ${CMAKE_COMMAND} -E make_directory "${MS2K_APP}/Contents/MacOS"
             COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ms2000_emulator>" "${MS2K_APP}/Contents/MacOS/ms2000_emulator"
             COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${MS2K_APP}/Contents/Info.plist"
+            COMMAND xattr -cr "${MS2K_APP}"   # codesign refuses extended attributes ("detritus")
             COMMAND codesign --force --sign - "${MS2K_APP}"
             DEPENDS ms2000_emulator
             COMMENT "Assembling MS2000R.app")
@@ -766,8 +777,12 @@ option(MS2K_BUILD_VST3 "Build the MS2000R VST3 plugin (JUCE)" OFF)
 if(MS2K_BUILD_VST3)
     include(FetchContent)
     # the JUCE fork gearmulator builds with (JUCE 7.0.10)
+    if(APPLE)   # MAC-4: one call the macOS 15+ SDK no longer has (cmake/macos/juce_patch.cmake)
+        set(MS2K_JUCE_PATCH PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/juce_patch.cmake)
+    endif()
     FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/dsp56300/JUCE.git
-                              GIT_TAG bf39bb3916cf6e5858a53831440eb1e58e5fb095)
+                              GIT_TAG bf39bb3916cf6e5858a53831440eb1e58e5fb095
+                              ${MS2K_JUCE_PATCH})
     FetchContent_MakeAvailable(JUCE)
     add_subdirectory(source/plugin)
 endif()

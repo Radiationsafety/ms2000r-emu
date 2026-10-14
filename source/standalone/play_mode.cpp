@@ -44,6 +44,10 @@ void listHostDevices()
     const auto outs = HostAudioOut::list();
     std::printf("Audio outputs:\n");
     for (size_t i = 0; i < outs.size(); ++i) std::printf("  %zu: %s%s\n", i, outs[i].name.c_str(), i == 0 ? "  (default)" : "");
+    const auto ins = HostAudioIn::list();
+    std::printf("Audio inputs:\n");
+    if (ins.empty()) std::printf("  (none)\n");
+    for (size_t i = 0; i < ins.size(); ++i) std::printf("  %zu: %s\n", i, ins[i].name.c_str());
     const auto mi = HostMidiIn::list();
     std::printf("MIDI inputs:\n");
     if (mi.empty()) std::printf("  (none)\n");

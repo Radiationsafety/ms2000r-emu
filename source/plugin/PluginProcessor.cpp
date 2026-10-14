@@ -26,6 +26,7 @@
 namespace {
 std::atomic<bool> g_machineTaken{ false };
 std::atomic<int> g_liveProcessors{ 0 };   // MULTI-1: read by the loader module (ms2k_liveProcessors)
+std::atomic<int> g_createdProcessors{ 0 };   // MAC-4: ever constructed here - the AU loader's "handed out and opened"
 
 bool validHome(const juce::File& d)
 {
@@ -65,6 +66,7 @@ Ms2kProcessor::Ms2kProcessor()
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
     ++g_liveProcessors;
+    ++g_createdProcessors;
     for (auto& m : knobs) for (auto& v : m) v = 512;     // every pot at its centre, as the standalone's default
     loadGlobalSettings();                                // SETTINGS-1
     // AUTOMATION-1: one host parameter per physical control (panel_params.h)
@@ -161,7 +163,13 @@ Ms2kProcessor::~Ms2kProcessor()
 
 // MULTI-1: how many machines this copy of the binary holds; the loader module (shim/ms2k_vst3_shim.cpp) gives a new
 // instance a copy where this is 0
+#ifdef _WIN32
 extern "C" __declspec(dllexport) int ms2k_liveProcessors() { return g_liveProcessors.load(); }
+#else
+extern "C" __attribute__((visibility("default"))) int ms2k_liveProcessors() { return g_liveProcessors.load(); }
+// MAC-4: the AU loader (shim/ms2k_au_shim.cpp) - an engine copy handed to a new instance is busy until this has grown
+extern "C" __attribute__((visibility("default"))) int ms2k_createdProcessors() { return g_createdProcessors.load(); }
+#endif
 
 void Ms2kProcessor::stopMachine()
 {
@@ -468,7 +476,7 @@ void Ms2kProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuf
                 for (int i = 0; i < 16; ++i) { l0[i] = s.line0[i] >= 0x20 ? s.line0[i] : '.'; l1[i] = s.line1[i] >= 0x20 ? s.line1[i] : '.'; }
                 l0[16] = l1[16] = 0;
                 const double now = juce::Time::getMillisecondCounterHiRes();
-                static const std::string logPath = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\ms2k_padstorm.log";
+                static const std::string logPath = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("ms2k_padstorm.log").getFullPathName().toStdString();
                 if (FILE* f = std::fopen(logPath.c_str(), "a")) {
                     std::fprintf(f, "%9.3f pad %2d | %s | %s | pc %06X | wall %7.1f ms\n", t, k + 1, l0, l1,
                                  unsigned(m_runner->getEmulator().getProgramCounter()), m_stormWall > 0 ? now - m_stormWall : 0.0);
@@ -587,7 +595,7 @@ void Ms2kProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuf
             sum += ms; mx = (std::max)(mx, ms);
             if (w0 < 0.0) w0 = t;
             if (t - w0 >= 0.05) {
-                static const std::string p = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\ms2k_render.log";
+                static const std::string p = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("ms2k_render.log").getFullPathName().toStdString();
                 if (FILE* f = std::fopen(p.c_str(), "a")) { std::fprintf(f, "%8.3f %6.2f %6.2f\n", w0, sum, mx); std::fclose(f); }
                 sum = mx = 0.0; w0 = t;
             }

@@ -29,6 +29,10 @@ inline int sprintf_s(char* buf, std::size_t size, const char* fmt, ...)
 template<std::size_t N, typename... A>
 inline int sprintf_s(char (&buf)[N], const char* fmt, A... args) { return std::snprintf(buf, N, fmt, args...); }
 
+// MSVC _putenv_s (MAC-4: the plugin sets MS2K_MODEL)
+#include <cstdlib>
+inline int _putenv_s(const char* name, const char* value) { return setenv(name, value, 1); }
+
 // MSVC argument order: (result, time) - the POSIX localtime_r has them the other way round.
 inline int localtime_s(std::tm* out, const std::time_t* t) { return localtime_r(t, out) ? 0 : errno; }
 
