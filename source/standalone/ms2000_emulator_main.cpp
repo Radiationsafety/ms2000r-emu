@@ -16,6 +16,7 @@
 #ifdef IMGUI_ENABLED
 #include "../gui/gui_win32_dx11.h"  // fw28.txt: Win32/DX11 GUI
 #include "../gui/thin_gui.h"
+#include "../gui/gui_platform.h"    // MAC-3: chooseFolder / alert
 #endif
 #include <iostream>
 #include <string>
@@ -25,6 +26,7 @@
 #include <vector>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>  // std::clamp
 #include <cstdlib>   // rand
 #include <iomanip>   // std::setw, std::setfill
@@ -540,12 +542,47 @@ static int runSelftest(const std::string& romPath, const CliConfig& config) {
 #if defined(_WIN32) && !defined(_WINDOWS_)
 extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void* module, wchar_t* name, unsigned long size);
 #endif
-static void ms2kFindHome() {
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <unistd.h>
+// MAC-3: the executable's path, and whether it runs from an app bundle (Finder: no arguments, cwd = /).
+static std::filesystem::path ms2kExePath() {
+    char buf[4096]; uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) != 0) return {};
+    std::error_code ec; const auto p = std::filesystem::canonical(buf, ec);
+    return ec ? std::filesystem::path(buf) : p;
+}
+static bool ms2kInAppBundle() { return ms2kExePath().string().find(".app/Contents/MacOS/") != std::string::npos; }
+// The folder the user chose once (GUI), as the plugin keeps it on Windows (%APPDATA%\MS2000R\home.txt).
+static std::filesystem::path ms2kHomeTxt() {
+    const char* h = std::getenv("HOME");
+    return h ? std::filesystem::path(h) / "Library" / "Application Support" / "MS2000R" / "home.txt" : std::filesystem::path();
+}
+#endif
+static bool ms2kHomeOk(const std::filesystem::path& d) {
     namespace fs = std::filesystem;
-    auto ok = [](const fs::path& d) { std::error_code ec; return fs::exists(d / "flash.bin", ec) && (fs::exists(d / "full FW" / "boot-362.ms2000.bin", ec) || fs::exists(d / "full FW" / "boot-362.bin", ec)); };
+    std::error_code ec; return fs::exists(d / "flash.bin", ec) && (fs::exists(d / "full FW" / "boot-362.ms2000.bin", ec) || fs::exists(d / "full FW" / "boot-362.bin", ec));
+}
+static bool ms2kFindHome() {
+    namespace fs = std::filesystem;
+    auto ok = ms2kHomeOk;
     fs::path home;
     if (const char* e = std::getenv("MS2K_HOME"); e && *e && ok(fs::path(e))) home = e;
-    else if (ok(fs::current_path())) return;
+    else if (ok(fs::current_path())) return true;
+#ifdef __APPLE__
+    else {   // MAC-3: the folders above the executable (an MS2000R.app put in the ROM folder), the remembered
+             // folder, ~/Documents/MS2000R
+        for (fs::path d = ms2kExePath().parent_path(); !d.empty(); d = d.parent_path()) {
+            if (ok(d)) { home = d; break; }
+            if (d == d.root_path()) break;
+        }
+        if (home.empty()) {
+            std::ifstream f(ms2kHomeTxt()); std::string line;
+            if (std::getline(f, line) && ok(fs::path(line))) home = line;
+        }
+        if (home.empty()) if (const char* h = std::getenv("HOME")) if (ok(fs::path(h) / "Documents" / "MS2000R")) home = fs::path(h) / "Documents" / "MS2000R";
+    }
+#endif
 #ifdef _WIN32
     else {
         // (not _get_wpgmptr: with a narrow main() it is unset and the CRT's invalid-parameter check ends the process)
@@ -557,14 +594,38 @@ static void ms2kFindHome() {
             }
     }
 #endif
-    if (home.empty()) return;
+    if (home.empty()) return false;
     std::error_code ec; fs::current_path(home, ec);
     std::cout << "[HOME] " << home.string() << std::endl;
+    return true;
 }
 
 int main(int argc, char** argv) {
-    ms2kFindHome();
+    const bool homeFound = ms2kFindHome();
     auto config = parseArgs(argc, argv);
+#if defined(__APPLE__) && defined(IMGUI_ENABLED)
+    // MAC-3: MS2000R.app from Finder = the GUI, its output in ms2000_gui.log (as "MS2000R (log).bat" on Windows).
+    // No ROM folder found: ask for it once and remember it.
+    if (ms2kInAppBundle() && argc == 1) config.mode = RunMode::GUI;
+    if (config.mode == RunMode::GUI && !homeFound) {
+        namespace fs = std::filesystem;
+        for (;;) {
+            std::string dir;
+            if (!GuiPlatform::chooseFolder("Choose the MS2000 folder - the one holding flash.bin and full FW/boot-362.bin", dir)) return 2;
+            if (ms2kHomeOk(dir)) {
+                std::error_code ec; fs::create_directories(ms2kHomeTxt().parent_path(), ec);
+                std::ofstream(ms2kHomeTxt()) << dir << "\n";
+                fs::current_path(dir, ec);
+                break;
+            }
+            GuiPlatform::alert("Not an MS2000 folder", "That folder has no flash.bin and full FW/boot-362.bin.");
+        }
+    }
+    if (config.mode == RunMode::GUI && ms2kInAppBundle() && argc == 1) {
+        if (std::freopen("ms2000_gui.log", "w", stdout)) dup2(fileno(stdout), fileno(stderr));   // one file, one offset
+        std::cout << "[HOME] " << std::filesystem::current_path().string() << std::endl;
+    }
+#endif
     
     // Sprint 1.4: Set global cycle reporting flag
     g_printCycles = config.cycles;

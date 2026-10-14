@@ -80,8 +80,6 @@ int runPlayMode(Ms2kRunner& R, const PlayOptions& o)
     // delays them to the frame they belong to (MIDI-OUT-TIMING); not done here yet.
     R.getEmulator().setMidiOutSink([&midiOut](uint8_t b) { midiOut.byte(b); });
 
-    R.start();
-
     // MVR-1: the VOLUME pot's law; the DSP ring holds 24-bit samples.
     const float gain = ms2kMasterVrGain(o.volume) / 8388608.0f;
     std::atomic<bool> primed{false};
@@ -97,10 +95,12 @@ int runPlayMode(Ms2kRunner& R, const PlayOptions& o)
     });
     if (!audioOk) {
         std::fprintf(stderr, "ERROR: audio output '%s' did not open: %s\n", outs[size_t(outSel)].name.c_str(), audio.lastError().c_str());
-        R.getEmulator().setMidiOutSink(nullptr); R.stop();
+        R.getEmulator().setMidiOutSink(nullptr);
         return 2;
     }
     R.setAudioPaced(true, 2400);                                 // 50 ms of emulated audio ahead
+    // The device opens before the machine starts (as in the thin GUI): until it runs, nothing paces the machine.
+    R.start();
     std::printf("[PLAY] audio -> %s (device %u Hz), VOLUME %.2f\n", outs[size_t(outSel)].name.c_str(), audio.deviceRate(), o.volume);
 
     HostMidiIn midiIn;

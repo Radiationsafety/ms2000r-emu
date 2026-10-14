@@ -54,7 +54,8 @@ if(NOT WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 endif()
 if(NOT MSVC)
-    add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/source/core/platform_compat.h)
+    # C++ only (MAC-3: GLFW is C)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX,OBJCXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/source/core/platform_compat.h>")
     # The sources use 256-bit AVX/AVX2 intrinsics (h8s2350_emulator.h, h8s2350_simd_optimizations).
     # MSVC emits them without a switch; GCC/Clang need the target enabled. Same CPU requirement as
     # the Windows build. MAC-1: arm64 (Apple Silicon) takes the scalar paths instead.
@@ -264,6 +265,7 @@ if(WIN32)
             source/gui/gui_win32_dx11.cpp
             source/gui/panel_widgets.cpp
             source/gui/thin_gui.cpp
+            source/gui/gui_platform_win32_dx11.cpp
             source/audio/host_io_win.cpp
         )
         target_link_libraries(ms2000_emulator imgui::imgui d3d11 dxgi comdlg32)
@@ -271,6 +273,53 @@ if(WIN32)
         message(STATUS "MS2000 Emulator with ImGui GUI support will be built")
     else()
         message(STATUS "ImGui not found - GUI mode will be disabled, fallback to headless")
+        target_compile_definitions(ms2000_emulator PRIVATE GUI_DISABLED)
+    endif()
+elseif(APPLE)
+    # MAC-3: the thin GUI on GLFW + Metal. ImGui and GLFW are fetched at configure time (as JUCE is for the plugin).
+    option(MS2K_MAC_GUI "Build the standalone GUI on macOS (fetches ImGui and GLFW)" ON)
+    if(MS2K_MAC_GUI)
+        enable_language(OBJCXX)
+        include(FetchContent)
+        FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.92.9 GIT_SHALLOW TRUE)
+        FetchContent_Declare(glfw GIT_REPOSITORY https://github.com/glfw/glfw.git GIT_TAG 3.4 GIT_SHALLOW TRUE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(glfw imgui)   # imgui has no CMakeLists: this only fetches it
+        add_library(ms2k_imgui STATIC
+            ${imgui_SOURCE_DIR}/imgui.cpp
+            ${imgui_SOURCE_DIR}/imgui_draw.cpp
+            ${imgui_SOURCE_DIR}/imgui_tables.cpp
+            ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
+        )
+        target_include_directories(ms2k_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+        target_link_libraries(ms2k_imgui PUBLIC glfw "-framework Metal" "-framework QuartzCore")
+        set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_sources(ms2000_emulator PRIVATE
+            source/gui/thin_gui.cpp
+            source/gui/gui_platform_mac.mm
+        )
+        set_source_files_properties(source/gui/gui_platform_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(ms2000_emulator ms2k_imgui
+            "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework UniformTypeIdentifiers")
+        target_compile_definitions(ms2000_emulator PRIVATE IMGUI_ENABLED)
+        message(STATUS "MS2000 Emulator with the ImGui GUI (GLFW + Metal) will be built")
+
+        # MS2000R.app: the same executable in a bundle (started from Finder it opens the GUI). Ad-hoc signed.
+        set(MS2K_APP "${CMAKE_BINARY_DIR}/MS2000R.app")
+        configure_file(cmake/macos/Info.plist.in "${CMAKE_BINARY_DIR}/Info.plist" @ONLY)
+        add_custom_target(MS2000R_app
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${MS2K_APP}/Contents/MacOS"
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ms2000_emulator>" "${MS2K_APP}/Contents/MacOS/ms2000_emulator"
+            COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${MS2K_APP}/Contents/Info.plist"
+            COMMAND codesign --force --sign - "${MS2K_APP}"
+            DEPENDS ms2000_emulator
+            COMMENT "Assembling MS2000R.app")
+    else()
         target_compile_definitions(ms2000_emulator PRIVATE GUI_DISABLED)
     endif()
 else()

@@ -1,16 +1,8 @@
 // Thin GUI for user tests (2026-09-24): audio out + MIDI in selection, the 2x16 LCD, status.
 // Everything shown is measured from the running emulation; nothing is simulated here.
-#define NOMINMAX
-#include <windows.h>
-#include <d3d11.h>
-#include <tchar.h>
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "winmm.lib")
-#include <timeapi.h>
-
+// MAC-3: the window, renderer and file dialogs are in gui_platform_*.cpp/.mm; this file is the same on every OS.
 #include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
+#include "gui_platform.h"
 
 #include "thin_gui.h"
 #include "../core/ms2000_runner.h"
@@ -22,15 +14,15 @@
 #include "vector_panel_imgui.h"
 #include "../core/syx_tool.h"
 #include "../core/knob_follow.h"
-#include <commdlg.h>
 #include <cmath>
 #include <algorithm>
-#include "../audio/host_io_win.h"
+#include "../audio/host_io.h"
 
 #include <atomic>
 #include <mutex>
 #include <ctime>
-#include <direct.h>
+#include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -39,43 +31,10 @@
 #include <deque>
 #include <thread>
 
-extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
-
 namespace {
-ID3D11Device*           g_dev = nullptr;
-ID3D11DeviceContext*    g_ctx = nullptr;
-IDXGISwapChain*         g_swap = nullptr;
-ID3D11RenderTargetView* g_rtv = nullptr;
-
-void createRT()  { ID3D11Texture2D* bb = nullptr; g_swap->GetBuffer(0, IID_PPV_ARGS(&bb)); if (bb) { g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv); bb->Release(); } }
-void cleanupRT() { if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; } }
-bool createDevice(HWND h)
-{
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = h;
-    sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    const D3D_FEATURE_LEVEL fl[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
-    D3D_FEATURE_LEVEL got;
-    return D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2, D3D11_SDK_VERSION,
-                                         &sd, &g_swap, &g_dev, &got, &g_ctx) == S_OK;
-}
-void cleanupDevice()
-{
-    cleanupRT();
-    if (g_swap) { g_swap->Release(); g_swap = nullptr; }
-    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
-    if (g_dev) { g_dev->Release(); g_dev = nullptr; }
-}
-LRESULT WINAPI wndProc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return true;
-    if (m == WM_SIZE && g_dev && w != SIZE_MINIMIZED) {
-        cleanupRT(); g_swap->ResizeBuffers(0, LOWORD(l), HIWORD(l), DXGI_FORMAT_UNKNOWN, 0); createRT(); return 0;
-    }
-    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProc(h, m, w, l);
-}
+// MAC-3: the wall clock, in ms and ns (were GetTickCount64 and QueryPerformanceCounter)
+uint64_t nowMs() { return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+int64_t nowNs() { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
 // HD44780 A00 character generator, if the local dump is present (16 bytes a character, rows
 // 0-7 used, 5 low bits). Without it the LCD is drawn as text.
@@ -83,7 +42,7 @@ struct CgRom { bool ok = false; uint8_t d[256][8]{}; };
 CgRom loadCgRom()
 {
     CgRom r;
-    for (const char* p : { "hd44780_a00.bin", "..\\hd44780_a00.bin", "..\\..\\hd44780_a00.bin" }) {
+    for (const char* p : { "hd44780_a00.bin", "../hd44780_a00.bin", "../../hd44780_a00.bin" }) {
         std::ifstream f(p, std::ios::binary);
         if (!f) continue;
         std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
@@ -152,41 +111,6 @@ void drawLcdPanel(const LcdGuiSnapshot& s, const CgRom& rom, ImVec2 a, ImVec2 b)
         }
 }
 
-// Saves this window's own back buffer as a BMP (MS2K_GUISHOT=<seconds>: once, that long after
-// start, to thin_gui_shot.bmp). Only the GUI's own pixels - never the rest of the screen.
-void saveBackBuffer(const char* path)
-{
-    ID3D11Texture2D* bb = nullptr;
-    if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return;
-    D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
-    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    ID3D11Texture2D* st = nullptr;
-    if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &st))) {
-        g_ctx->CopyResource(st, bb);
-        D3D11_MAPPED_SUBRESOURCE m;
-        if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-            FILE* f = fopen(path, "wb");
-            if (f) {
-                const uint32_t w = d.Width, h = d.Height, row = w * 4, size = 54 + row * h;
-                uint8_t hdr[54] = { 'B', 'M' };
-                auto put = [&](int o, uint32_t v) { hdr[o] = uint8_t(v); hdr[o + 1] = uint8_t(v >> 8); hdr[o + 2] = uint8_t(v >> 16); hdr[o + 3] = uint8_t(v >> 24); };
-                put(2, size); put(10, 54); put(14, 40); put(18, w); put(22, h); hdr[26] = 1; hdr[28] = 32; put(34, row * h);
-                fwrite(hdr, 1, 54, f);
-                std::vector<uint8_t> line(row);
-                for (int y = int(h) - 1; y >= 0; --y) {
-                    const uint8_t* src = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
-                    for (uint32_t x = 0; x < w; ++x) { line[4*x] = src[4*x+2]; line[4*x+1] = src[4*x+1]; line[4*x+2] = src[4*x]; line[4*x+3] = 255; }
-                    fwrite(line.data(), 1, row, f);
-                }
-                fclose(f);
-            }
-            g_ctx->Unmap(st, 0);
-        }
-        st->Release();
-    }
-    bb->Release();
-}
-
 struct Settings {
     std::string audio, midi, midiOut; float volume = 0.7f;
     bool powerSwitch = true;                          // PWR-SW-1: the VOLUME pot's switch - off at the minimum
@@ -248,40 +172,23 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
     bool off = false;
     static VPanel::IO vio;                                // the vector panel's state (held keys survive a power cycle)
     static bool swHeld[7][8] = {};                        // the test panel's held keys
-    // An emulator is a real-time load: opt out of Windows' execution-speed throttling (EcoQoS),
-    // which is applied to windows that are not in the foreground, and ask for 1 ms timer
-    // granularity so the audio-paced 1 ms waits are 1 ms.
-    {
-        PROCESS_POWER_THROTTLING_STATE pt{};
-        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-        pt.StateMask = 0;
-        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
-        timeBeginPeriod(1);
-    }
-    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, wndProc, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, _T("MS2000Thin"), nullptr };
-    RegisterClassEx(&wc);
-    HWND hwnd = CreateWindow(wc.lpszClassName, _T("MS2000R emulator v") MS2K_VERSION, WS_OVERLAPPEDWINDOW, 30, 20, 1600, 1060, nullptr, nullptr, wc.hInstance, nullptr);
-    if (!createDevice(hwnd)) { cleanupDevice(); UnregisterClass(wc.lpszClassName, wc.hInstance); return -1; }
-    createRT();
-    ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
+    GuiPlatform::beginRealtime();
+    if (!GuiPlatform::createWindow("MS2000R emulator v" MS2K_VERSION, 1600, 1060)) return -1;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
-    // VECTOR-PANEL legends: a narrow bold sans from Windows, loaded large so it scales down crisp; the
+    // VECTOR-PANEL legends: a narrow bold sans from the OS, loaded large so it scales down crisp; the
     // default font stays the UI font (added first). None found -> the default font.
     ImFont* panelFont = nullptr;
     {
         ImGuiIO& fio = ImGui::GetIO();
         fio.Fonts->AddFontDefault();
-        const char* cands[] = { "C:\\Windows\\Fonts\\ARIALNB.TTF", "C:\\Windows\\Fonts\\arialbd.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf" };
-        for (const char* cf : cands)
-            if (GetFileAttributesA(cf) != INVALID_FILE_ATTRIBUTES) { panelFont = fio.Fonts->AddFontFromFileTTF(cf, 40.0f); break; }
+        for (const std::string& cf : GuiPlatform::panelFontFiles())
+            if (std::filesystem::exists(cf)) { panelFont = fio.Fonts->AddFontFromFileTTF(cf.c_str(), 40.0f); break; }
     }
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_dev, g_ctx);
+    GuiPlatform::initBackends();
 
     const CgRom rom = loadCgRom();
     Settings st = loadSettings();
@@ -301,9 +208,9 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
         std::atomic<bool> active{false};   // PERF-124: the audio callback must not take a lock per sample when idle
         void start() {
             std::lock_guard<std::mutex> l(mx); if (f) return;
-            _mkdir("recordings");
+            std::error_code ec; std::filesystem::create_directory("recordings", ec);
             char nm[96]; time_t t = time(nullptr); tm lt; localtime_s(&lt, &t);
-            strftime(nm, sizeof nm, "recordings\\ms2000_%Y%m%d_%H%M%S.wav", &lt);
+            strftime(nm, sizeof nm, "recordings/ms2000_%Y%m%d_%H%M%S.wav", &lt);
             path = nm; f = fopen(nm, "wb"); frames = 0;
             if (f) { uint8_t h[44] = {}; fwrite(h, 1, 44, f); active.store(true, std::memory_order_release); }
         }
@@ -358,26 +265,25 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
     syx.setSend([&R](const uint8_t* p, size_t n) { R->sendMIDIData(p, n); });
     auto setSink = [&]() { R->getEmulator().setMidiOutSink([&midiOut, dsp](uint8_t b) {
         syx.feed(b);
-        if (dsp && moc.on.load(std::memory_order_acquire)) { LARGE_INTEGER t; QueryPerformanceCounter(&t); std::lock_guard<std::mutex> l(moc.mx); moc.q.push_back({ dsp->txFrames(), b, t.QuadPart }); }
+        if (dsp && moc.on.load(std::memory_order_acquire)) { const int64_t t = nowNs(); std::lock_guard<std::mutex> l(moc.mx); moc.q.push_back({ dsp->txFrames(), b, t }); }
         else midiOut.byte(b);
     }); };
     setSink();
     moc.th = std::thread([&midiOut] {
-        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
         std::vector<uint8_t> out;
         while (!moc.stop.load()) {
-            Sleep(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             out.clear();
             {
                 std::lock_guard<std::mutex> l(moc.mx);
                 if (!moc.on.load()) { for (auto& e : moc.q) out.push_back(e.b); moc.q.clear(); }
                 else if (!moc.q.empty()) {
-                    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                    const int64_t now = nowNs();
                     const uint64_t base = moc.base.load();
-                    const double dt = double(now.QuadPart - moc.baseQpc.load()) / double(f.QuadPart);
+                    const double dt = double(now - moc.baseQpc.load()) * 1e-9;
                     const double heard = double(base) - 960.0 + (std::min)(dt, 0.05) * 48000.0;
                     while (!moc.q.empty() && double(moc.q.front().frame) <= heard) {
-                        moc.lagSum.store(moc.lagSum.load() + double(now.QuadPart - moc.q.front().qpc) * 1000.0 / double(f.QuadPart)); ++moc.lagN;
+                        moc.lagSum.store(moc.lagSum.load() + double(now - moc.q.front().qpc) * 1e-6); ++moc.lagN;
                         out.push_back(moc.q.front().b); moc.q.pop_front();
                     }
                 }
@@ -405,8 +311,7 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
             while (n < frames && dsp->popAudio(l, r)) { lr[2 * n] = l * g; lr[2 * n + 1] = r * g; rec.push(l, r); ++n; }
             if (n) {
                 primed = true;
-                LARGE_INTEGER now; QueryPerformanceCounter(&now);   // MIDI-OUT-TIMING: where the listener is
-                moc.base.store(dsp->txFrames() - dsp->audioFill()); moc.baseQpc.store(now.QuadPart);
+                moc.base.store(dsp->txFrames() - dsp->audioFill()); moc.baseQpc.store(nowNs());   // MIDI-OUT-TIMING: where the listener is
             }
             // Before the DSP's first frame (boot) an empty ring is not an underrun - it is the
             // silence of a machine that has not started its audio yet.
@@ -477,51 +382,51 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
         printf("[THIN-GUI] POWER off (VOLUME at its minimum)\n"); fflush(stdout);
     };
     auto powerOn = [&]() {
-        static ULONGLONG lastTry = 0;
-        if (GetTickCount64() - lastTry < 2000) return;
-        lastTry = GetTickCount64();
+        static uint64_t lastTry = 0;
+        if (nowMs() - lastTry < 2000) return;
+        lastTry = nowMs();
         owned = makeRunner ? makeRunner() : nullptr;
         if (!owned) { printf("[THIN-GUI] power on FAILED (machine did not init)\n"); fflush(stdout); return; }
         R = owned.get(); off = false;
         wireMachine();
+        openAudio();                                      // MAC-3: before the start, as above
         R->start();
-        openAudio(); openAudioIn(); openMidi();
+        openAudioIn(); openMidi();
         printf("[THIN-GUI] POWER on - cold boot\n"); fflush(stdout);
     };
 
     // PANEL-IO: the pots stand where they stood before the firmware first reads them.
     for (unsigned m = 0; m < 4; ++m) for (unsigned x = 0; x < 8; ++x) R->getEmulator().setPanelKnob(m, x, st.knob[m][x]);
     openMidiOut();
+    // MAC-3: the audio device opens BEFORE the machine starts - opening it can take seconds (measured 1.7 s on macOS
+    // started from Finder), and until it is open nothing paces the machine: it ran ahead and overflowed the ring.
     if (st.powerSwitch && ms2kPowerSwitchOpen(st.volume)) { R = nullptr; dsp = nullptr; off = true; }   // switched off: no boot
-    else R->start();
-    openAudio();
+    else { openAudio(); R->start(); }
     openAudioIn();
     openMidi();
 
-    ULONGLONG shotAt = 0;
-    if (const char* e = getenv("MS2K_GUISHOT")) shotAt = GetTickCount64() + ULONGLONG(atof(e) * 1000.0);
-    int demoPhase = 0; ULONGLONG demoT0 = 0, demoAt = 0;
-    if (const char* e = getenv("MS2K_GUI_DEMO")) demoAt = GetTickCount64() + ULONGLONG(atof(e) * 1000.0);   // test: press at t
+    uint64_t shotAt = 0;
+    if (const char* e = getenv("MS2K_GUISHOT")) shotAt = nowMs() + uint64_t(atof(e) * 1000.0);
+    int demoPhase = 0; uint64_t demoT0 = 0, demoAt = 0;
+    if (const char* e = getenv("MS2K_GUI_DEMO")) demoAt = nowMs() + uint64_t(atof(e) * 1000.0);   // test: press at t
     bool testNote = false;
     bool done = false;
     while (!done) {
-        MSG msg;
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); if (msg.message == WM_QUIT) done = true; }
-        if (done) break;
+        if (!GuiPlatform::pollEvents()) break;
         {   // PWR-SW-1: the VOLUME pot's switch section
             const bool open = st.powerSwitch && ms2kPowerSwitchOpen(st.volume);
             if (open && !off) powerOff(); else if (!open && off) powerOn();
         }
 
-        ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
+        GuiPlatform::newFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
         {   // HOST-AUDIO-STALL (2026-09-27): a host stream that ended on its own (device reset, lost clock)
             // no longer freezes the machine - stop pacing on it at once, then reopen it every 2 s.
-            static ULONGLONG lastOut = 0, lastIn = 0;
-            const ULONGLONG now = GetTickCount64();
+            static uint64_t lastOut = 0, lastIn = 0;
+            const uint64_t now = nowMs();
             moc.on.store(audio.isOpen() && !audio.dead() && primed.load(), std::memory_order_release);   // MIDI-OUT-TIMING
             if (audio.dead()) {
                 if (R && R->isAudioPaced()) R->setAudioPaced(false);
@@ -628,9 +533,9 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
         H8S2350Emulator* cpu = R ? &R->getEmulator() : nullptr;   // PWR-SW-1: nullptr while switched off
         const H8S2350Emulator::PanelLeds leds = cpu ? cpu->panelLeds() : H8S2350Emulator::PanelLeds{};
         {   // MS2K_GUILEDLOG=1 (R2 diagnostic, default off): once a second, the LEDs exactly as this frame draws them.
-            static const bool on = getenv("MS2K_GUILEDLOG") != nullptr; static ULONGLONG last = 0;
-            if (on && GetTickCount64() - last >= 1000) {
-                last = GetTickCount64();
+            static const bool on = getenv("MS2K_GUILEDLOG") != nullptr; static uint64_t last = 0;
+            if (on && nowMs() - last >= 1000) {
+                last = nowMs();
                 printf("[GUI-LEDS] emu=%.2f", dsp ? double(dsp->txFrames()) / 48000.0 : 0.0);
                 for (unsigned r = 0; r < 8; ++r) for (unsigned c = 0; c < 12; ++c)
                     if (leds.lit[r][c] > 0.25f) printf(" LS%u.LD%02u(%.2f)", r, c, double(leds.lit[r][c]));
@@ -701,20 +606,20 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
             vio.lit = leds.lit; vio.shown = shown; vio.knobs = st.knob;
             // KNOB-FOLLOW (knob_follow.h): drawn from the edit buffer; a pot being turned keeps the mouse's value
             // until 300 ms after its last move; turning a pot always moves the physical pot (st.knob).
-            static uint16_t disp[4][8]; static int lastMoved = -1; static ULONGLONG lastMs = 0;
+            static uint16_t disp[4][8]; static int lastMoved = -1; static uint64_t lastMs = 0;
             if (st.knobFollow && cpu) {
                 uint8_t prog[254];
                 for (int i = 0; i < 254; ++i) prog[i] = cpu->peekExternal(MS2000::kEditBufferAddr + uint32_t(i));
                 uint16_t want[4][8]; bool fol[4][8];
                 MS2000::programKnobs(prog, leds.lit[5][2] > 0.5f ? 1 : 0, want, fol);
-                const bool held = ImGui::IsMouseDown(0) || GetTickCount64() - lastMs < 300;
+                const bool held = ImGui::IsMouseDown(0) || nowMs() - lastMs < 300;
                 for (int m = 0; m < 4; ++m) for (int x = 0; x < 8; ++x)
                     if (!(held && m * 8 + x == lastMoved)) disp[m][x] = fol[m][x] ? want[m][x] : st.knob[m][x];
                 vio.knobs = disp;
             }
             vio.volume = &st.volume; vio.in1 = &st.vr30; vio.in2 = &st.vr31;
             vio.sw = [&cpu, &demoPhase](unsigned c, unsigned r, bool d) { if (demoPhase == 0) if (cpu) cpu->setPanelSwitch(c, r, d); };
-            vio.knob = [&cpu, &st](unsigned m, unsigned x, uint16_t v) { st.knob[m][x] = v; if (cpu) cpu->setPanelKnob(m, x, v); lastMoved = int(m * 8 + x); lastMs = GetTickCount64(); };
+            vio.knob = [&cpu, &st](unsigned m, unsigned x, uint16_t v) { st.knob[m][x] = v; if (cpu) cpu->setPanelKnob(m, x, v); lastMoved = int(m * 8 + x); lastMs = nowMs(); };
             const LcdGuiSnapshot lcdSnap = R ? R->getLcdGuiSnapshot() : LcdGuiSnapshot{};
             VPanel::ImGuiBackend vbe;
             vbe.dl = ImGui::GetWindowDrawList(); vbe.f = panelFont ? panelFont : ImGui::GetFont();
@@ -842,11 +747,11 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
         }
         // Owner's manual p.12 "Listen to the demo performance": hold [EXIT], then press and hold
         // [GLOBAL], about one second. Done here as that key sequence on the switch matrix.
-        if (ImGui::Button("Demo songs (EXIT + GLOBAL)") && demoPhase == 0) { demoPhase = 1; demoT0 = GetTickCount64(); }
+        if (ImGui::Button("Demo songs (EXIT + GLOBAL)") && demoPhase == 0) { demoPhase = 1; demoT0 = nowMs(); }
         {   // MS2K_GUI_REC="<start s>:<length s>" - test: the Record button pressed and released by time
-            static double rs = -1, rl = 0; static ULONGLONG t0 = GetTickCount64(); static int ph = 0;
+            static double rs = -1, rl = 0; static uint64_t t0 = nowMs(); static int ph = 0;
             if (rs < 0) { rs = 1e9; if (const char* e = getenv("MS2K_GUI_REC")) sscanf(e, "%lf:%lf", &rs, &rl); }
-            const double now = double(GetTickCount64() - t0) / 1000.0;
+            const double now = double(nowMs() - t0) / 1000.0;
             if (ph == 0 && now >= rs) { rec.start(); ph = 1; }
             else if (ph == 1 && now >= rs + rl) { rec.stop(); ph = 2; }
         }
@@ -859,16 +764,8 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
             char lbl[64]; snprintf(lbl, sizeof lbl, "Stop recording (%.1f s)###recbtn", rec.seconds());
             if (ImGui::Button(lbl)) rec.stop();
         }
-        {   // SYX-1: a .syx into the machine's MIDI IN / all 128 programs out of it (Windows file dialogs)
-            auto dlg = [&](bool saving, std::string& out) {
-                char file[MAX_PATH] = {};
-                OPENFILENAMEA ofn{}; ofn.lStructSize = sizeof ofn; ofn.hwndOwner = hwnd;
-                ofn.lpstrFilter = "SysEx (*.syx)\0*.syx\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH;
-                ofn.lpstrDefExt = "syx";
-                ofn.Flags = OFN_NOCHANGEDIR | (saving ? OFN_OVERWRITEPROMPT : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST));
-                if (!(saving ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn))) return false;
-                out = file; return true;
-            };
+        {   // SYX-1: a .syx into the machine's MIDI IN / all 128 programs out of it (the OS file dialogs)
+            auto dlg = [](bool saving, std::string& out) { return GuiPlatform::fileDialog(saving, out); };
             ImGui::SameLine();
             std::string f;
             if (ImGui::Button("Load .syx") && !syx.busy() && dlg(false, f)) syx.startImport(f);
@@ -877,9 +774,9 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
             syx.poll();
             if (!syx.status().empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", syx.status().c_str()); }
         }
-        if (demoAt > 0 && GetTickCount64() >= demoAt && demoPhase == 0) { demoAt = 0; demoPhase = 1; demoT0 = GetTickCount64(); }
+        if (demoAt > 0 && nowMs() >= demoAt && demoPhase == 0) { demoAt = 0; demoPhase = 1; demoT0 = nowMs(); }
         if (demoPhase) {
-            const ULONGLONG dt = GetTickCount64() - demoT0;
+            const uint64_t dt = nowMs() - demoT0;
             if (demoPhase == 1) { if (cpu) cpu->setPanelSwitch(4, 0, true); demoPhase = 2; }                        // EXIT down
             else if (demoPhase == 2 && dt >= 200) { if (cpu) cpu->setPanelSwitch(3, 6, true); demoPhase = 3; }       // GLOBAL down
             else if (demoPhase == 3 && dt >= 1400) { if (cpu) cpu->setPanelSwitch(3, 6, false); if (cpu) cpu->setPanelSwitch(4, 0, false); demoPhase = 0; }
@@ -888,8 +785,8 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
 
         ImGui::Separator();
         {   // once a second on stdout: the same measured figures, with the wall clock
-            static ULONGLONG t0 = GetTickCount64(), last = 0;
-            const ULONGLONG now = GetTickCount64();
+            static uint64_t t0 = nowMs(), last = 0;
+            const uint64_t now = nowMs();
             if (dsp && now - last >= 1000) {
                 last = now;
                 printf("[THIN-GUI] wall=%.1f s emu=%.2f s ring=%.1f ms underrun=%llu overflow=%llu | in: fill=%.1f/%.1f ms underrun=%llu skip=%llu clip=%llu/%llu | shi-ovr=%llu | midi-out delay %.1f ms\n",
@@ -919,11 +816,9 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
 
         ImGui::Render();
         const float clear[4] = { 0.08f, 0.09f, 0.10f, 1.0f };
-        g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
-        g_ctx->ClearRenderTargetView(g_rtv, clear);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        if (shotAt > 0 && GetTickCount64() >= shotAt) { saveBackBuffer("thin_gui_shot.bmp"); shotAt = 0; }
-        g_swap->Present(1, 0);
+        const bool shot = shotAt > 0 && nowMs() >= shotAt;
+        GuiPlatform::render(clear, shot ? "thin_gui_shot.bmp" : nullptr);   // MS2K_GUISHOT=<s>: this frame as a BMP
+        if (shot) shotAt = 0;
     }
 
     saveSettings(st);
@@ -935,10 +830,8 @@ int run_thin_gui(MS2000::Ms2kRunner& runner, std::function<std::unique_ptr<MS200
     rec.stop();                                                        // finish the WAV header on exit
     if (R) { R->setAudioPaced(false); R->stop(); }
 
-    timeEndPeriod(1);
-    ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
-    cleanupDevice();
-    DestroyWindow(hwnd);
-    UnregisterClass(wc.lpszClassName, wc.hInstance);
+    GuiPlatform::endRealtime();
+    GuiPlatform::shutdownBackends(); ImGui::DestroyContext();
+    GuiPlatform::destroyWindow();
     return 0;
 }
