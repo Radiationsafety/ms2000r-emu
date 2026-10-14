@@ -244,6 +244,17 @@ if(MSVC)
     target_link_options(ms2000_emulator PRIVATE /OPT:NOREF /MAP)   # PERF-124: map for the sampling profiler
 endif()
 
+# MAC-2: --play - CoreAudio output and CoreMIDI in/out (source/audio/host_io_mac.cpp)
+if(APPLE)
+    target_sources(ms2000_emulator PRIVATE
+        source/audio/host_io_mac.cpp
+        source/standalone/play_mode.cpp
+    )
+    target_compile_definitions(ms2000_emulator PRIVATE MS2K_HOST_IO)
+    target_link_libraries(ms2000_emulator
+        "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreMIDI" "-framework CoreFoundation")
+endif()
+
 # fw28.txt: Try to add ImGui Win32/DX11 support for GUI mode
 if(WIN32)
     find_package(imgui CONFIG QUIET)

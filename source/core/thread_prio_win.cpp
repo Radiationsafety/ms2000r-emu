@@ -24,6 +24,12 @@ void ms2kAudioWorkerThread()
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof st);
 }
 }
+#elif defined(__APPLE__)
+// MAC-2: the macOS counterpart - QoS USER_INTERACTIVE, so the scheduler keeps the thread on the performance
+// cores and does not throttle it when the app goes to the background.
+#include <pthread.h>
+#include <pthread/qos.h>
+namespace MS2000 { void ms2kAudioWorkerThread() { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); } }
 #else
 namespace MS2000 { void ms2kAudioWorkerThread() {} }
 #endif

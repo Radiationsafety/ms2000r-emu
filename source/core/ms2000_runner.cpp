@@ -544,8 +544,14 @@ uint32_t Ms2kRunner::render(float* left, float* right, uint32_t frames, const Mi
     return frames;
 }
 
+#ifdef __APPLE__
+void ms2kAudioWorkerThread();   // thread_prio_win.cpp
+#endif
 void Ms2kRunner::cpuThreadLoop() {
     InstallCrashHandlersThisThread();
+#ifdef __APPLE__
+    ms2kAudioWorkerThread();   // MAC-2: the emulation thread on the performance cores (QoS)
+#endif
     using clk = std::chrono::steady_clock;
     auto next = clk::now();
 

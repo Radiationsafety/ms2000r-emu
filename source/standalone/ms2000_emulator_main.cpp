@@ -10,6 +10,9 @@
 #include "../tests/snapshot_golden_master_test.h"  // fw27.txt: Golden master testing
 #include "../core/soak_test_monitor.h"  // fw27.txt: Long-run soak testing
 #include "../core/panel_timeline_visualizer.h"  // fw27.txt: Panel timeline & LCD diff visualization
+#ifdef MS2K_HOST_IO
+#include "play_mode.h"  // MAC-2: --play
+#endif
 #ifdef IMGUI_ENABLED
 #include "../gui/gui_win32_dx11.h"  // fw28.txt: Win32/DX11 GUI
 #include "../gui/thin_gui.h"
@@ -63,6 +66,11 @@ struct CliConfig {
     std::string record = "";
     std::string replay = "";
     std::string renderTest = "";   // ENGINE-BLOCK: --render-test <out.wav> (headless, manual mode, --duration = emulated s)
+    // MAC-2: --play - the machine on the host audio device / MIDI ports (--midi-in, --midi-out), no GUI
+    bool play = false;
+    std::string audioDevice = "";
+    float volume = 0.7f;
+    bool durationGiven = false;
     RunMode mode = RunMode::HEADLESS;
     int durationSec = 5;
     bool help = false;
@@ -160,6 +168,10 @@ static void showHelp() {
     std::cout << "  --diag                Show diagnostic panel (developer radar)\n";
     std::cout << "  --mmcss               Enable Windows MMCSS Pro Audio priority\n";
     std::cout << "  --cycles              Show cycle count summary at end (P1 Cycle Model)\n";
+    std::cout << "  --play                Play through the host audio device; --midi-in/--midi-out <name> connect MIDI\n";
+    std::cout << "                        (runs until Ctrl+C, or --duration seconds)\n";
+    std::cout << "  --audio-device <name> Audio output for --play (part of its name; default: the system output)\n";
+    std::cout << "  --volume <0-1>        The VOLUME pot for --play (default: 0.7)\n";
     std::cout << "  --audio               Enable I2S/AK4522 audio pipeline\n";
     std::cout << "  --sample-rate <hz>    Audio sample rate (default: 48000)\n";
     std::cout << "  --buffer-frames <n>   Audio buffer size in frames (default: 256)\n";
@@ -239,12 +251,20 @@ static CliConfig parseArgs(int argc, char** argv) {
             config.renderTest = argv[++i];
         } else if ((arg == "--duration" || arg == "-d") && i + 1 < argc) {
             config.durationSec = parseIntArg(argv[++i], config.durationSec);
+            config.durationGiven = true;
         } else if (arg == "--diag") {
             config.showDiag = true;
         } else if (arg == "--mmcss") {
             config.useMmcss = true;
         } else if (arg == "--cycles") {
             config.cycles = true;
+        } else if (arg == "--play") {
+            config.play = true;
+            config.mode = RunMode::HEADLESS;
+        } else if (arg == "--audio-device" && i + 1 < argc) {
+            config.audioDevice = argv[++i];
+        } else if (arg == "--volume" && i + 1 < argc) {
+            config.volume = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f);
         } else if (arg == "--audio") {
             config.audio = true;
         } else if (arg == "--sample-rate" && i + 1 < argc) {
@@ -684,6 +704,12 @@ int main(int argc, char** argv) {
     }
 
     // fw27.txt Phase 2: Handle MIDI device listing
+#ifdef MS2K_HOST_IO
+    if (config.listMidiDevices) {   // MAC-2: the real devices
+        MS2000::listHostDevices();
+        return 0;
+    }
+#endif
     if (config.listMidiDevices) {
         std::cout << "fw27.txt: Available MIDI devices...\n";
         
@@ -1279,6 +1305,16 @@ int main(int argc, char** argv) {
         return 2;  // I/O error
     }
 
+#ifdef MS2K_HOST_IO
+    if (config.play) {
+        MS2000::PlayOptions po;
+        po.audioDevice = config.audioDevice; po.midiIn = config.midiInDevice; po.midiOut = config.midiOutDevice;
+        po.volume = config.volume; po.durationSec = config.durationGiven ? config.durationSec : 0;
+        return MS2000::runPlayMode(runner, po);
+    }
+#else
+    if (config.play) { std::cerr << "ERROR: --play is not available in this build (no host audio backend)\n"; return 2; }
+#endif
     // ENGINE-BLOCK (VST3 phase 0): the machine driven block by block from here, as a plugin host would - no CPU
     // thread. Blocks of pseudo-random length 16..1024 frames (a fixed LCG, so every run is the same); the frames are
     // written as a 32-bit WAV in the MS2K_DSPWAV format, so the two files can be compared frame for frame.

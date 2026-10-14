@@ -44,7 +44,7 @@ Standalone application (Windows, ImGui) with the full MS2000R front panel, and a
   `Contents\Resources\MS2000R_engine.dll`; every instance after the first runs from its own copy of it in
   `%TEMP%\MS2000R_engines` (removed when the host unloads the plugin), so each instance is a separate machine.
 
-Known limits: Windows only for the GUI and the plugin (Linux: headless build, see below). VSTHost stops calling a plugin that sends SysEx to it (e.g. on leaving the demo songs):
+Known limits: Windows only for the GUI and the plugin (Linux: headless build; macOS: headless build with live audio and MIDI, see below). VSTHost stops calling a plugin that sends SysEx to it (e.g. on leaving the demo songs):
 switch off "MIDI OUT SysEx -> host" in the plugin's Settings there. The emulator needs a recent CPU - it runs about 2x real time on a current desktop; the plugin runs at
 96 kHz with a 128-sample buffer (measured: 0.62 ms median, 0.96 ms worst per 1.33 ms block after the boot).
 Next: a preset library page.
@@ -101,6 +101,25 @@ MS2K_MIDIIN="2:C008;2.3:903C64;3.8:803C00" <repo>/build/ms2000_emulator --headle
 
 `MS2K_MIDIIN` schedules MIDI IN bytes at MCU seconds (`t:hex;t:hex`); `--render-test` writes the DSP's frames
 as a 32-bit WAV. `ctest` in the build folder runs the test suite.
+
+## Build (macOS)
+
+Apple Silicon builds natively (the DSP runs on the dsp56300 library's ARM64 JIT; its output is bit-identical to the
+x64 build). Xcode Command Line Tools, CMake 3.16+ and Ninja (`brew install cmake ninja`). No GUI and no plugin yet.
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target ms2000_emulator
+cd <folder with the ROMs> && <repo>/build/ms2000_emulator --headless --selftest-full
+<repo>/build/ms2000_emulator --list-midi
+<repo>/build/ms2000_emulator --play --midi-in "<part of a MIDI port's name>" --midi-out "<part of a name>"
+```
+
+`--play` runs the machine on the default audio output (`--audio-device <name>` picks another, `--volume 0..1` is the
+VOLUME pot, default 0.7) until Ctrl+C; every panel pot stands at its centre. The firmware boots in about 3 s,
+muted - a note sent before that is not heard (the `MS2K_MIDIIN` example above plays during the boot; use
+`4.0:903C64;6.0:803C00` with `--duration 8`). Audio input (vocoder) is not wired on macOS yet.
+`-DCMAKE_OSX_ARCHITECTURES=x86_64` builds the x64 version, which runs under Rosetta 2.
 
 VST3 plugin (JUCE is fetched at configure time):
 
