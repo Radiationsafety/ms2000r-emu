@@ -1,10 +1,17 @@
+# MAC-4: macOS also builds the Audio Unit (Logic and GarageBand load only AUs)
+if(APPLE)
+    set(MS2K_PLUGIN_FORMATS VST3 AU)
+else()
+    set(MS2K_PLUGIN_FORMATS VST3)
+endif()
 # MS2000R VST3 (phase 1; phase 2 = VST3-2: the vector panel editor, state in the project). Built only with -DMS2K_BUILD_VST3=ON, in its own build folder (build_vst).
 juce_add_plugin(MS2000R_VST
     COMPANY_NAME "MS2000 emulation project"
     PRODUCT_NAME "MS2000R"
     PLUGIN_MANUFACTURER_CODE Msem
     PLUGIN_CODE Ms2r
-    FORMATS VST3
+    FORMATS ${MS2K_PLUGIN_FORMATS}
+    BUNDLE_ID io.github.ms2000r-emu.plugin
     IS_SYNTH TRUE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT TRUE
@@ -49,7 +56,7 @@ target_compile_definitions(MS2000IplBridge PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_C
 target_link_libraries(MS2000IplBridge PRIVATE ms2000 juce::juce_audio_devices PUBLIC juce::juce_recommended_config_flags)
 
 # MULTI-1 (2026-10-02): several instances per process. The host loads this small VST3 module; the JUCE plugin above
-# travels in the bundle as Contents/Resources/MS2000R_engine.dll and every instance after the first runs from its
+# travels in the bundle as Contents/Resources/MS2000R_engine.dll (macOS: MS2000R_engine) and every instance after the first runs from its
 # own copy of it (see shim/ms2k_vst3_shim.cpp). Result: build_vst/VST3_multi/MS2000R.vst3
 if(WIN32)
     set(MS2K_VST3SDK ${JUCE_MODULES_DIR}/juce_audio_processors/format_types/VST3_SDK)   # the VST3 SDK headers JUCE carries
@@ -65,4 +72,41 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory ${MS2K_MULTI}/Contents/x86_64-win ${MS2K_MULTI}/Contents/Resources
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:MS2000R_VST_VST3> ${MS2K_MULTI}/Contents/Resources/MS2000R_engine.dll
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:MS2000R_Shim> ${MS2K_MULTI}/Contents/x86_64-win/MS2000R.vst3)
+elseif(APPLE)
+    # MAC-4: the same on macOS - JUCE's bundle with its binary moved to Contents/Resources/MS2000R_engine and the
+    # loader module as Contents/MacOS/MS2000R. Ad-hoc signed (the engine first: it is code outside Contents/MacOS).
+    set(MS2K_VST3SDK ${JUCE_MODULES_DIR}/juce_audio_processors/format_types/VST3_SDK)
+    add_library(MS2000R_Shim MODULE shim/ms2k_vst3_shim.cpp
+        ${MS2K_VST3SDK}/pluginterfaces/base/coreiids.cpp ${MS2K_VST3SDK}/pluginterfaces/base/funknown.cpp)
+    target_include_directories(MS2000R_Shim PRIVATE ${MS2K_VST3SDK})
+    target_compile_features(MS2000R_Shim PRIVATE cxx_std_17)
+    set_target_properties(MS2000R_Shim PROPERTIES CXX_VISIBILITY_PRESET hidden PREFIX "" SUFFIX "" OUTPUT_NAME MS2000R_shim)
+    target_link_libraries(MS2000R_Shim PRIVATE "-framework CoreFoundation")
+    add_dependencies(MS2000R_Shim MS2000R_VST_VST3)
+    set(MS2K_MULTI ${CMAKE_BINARY_DIR}/VST3_multi/MS2000R.vst3)
+    add_custom_command(TARGET MS2000R_Shim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${MS2K_MULTI}
+        COMMAND ${CMAKE_COMMAND} -E copy_directory $<TARGET_BUNDLE_DIR:MS2000R_VST_VST3> ${MS2K_MULTI}
+        COMMAND ${CMAKE_COMMAND} -E rename ${MS2K_MULTI}/Contents/MacOS/MS2000R ${MS2K_MULTI}/Contents/Resources/MS2000R_engine
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:MS2000R_Shim> ${MS2K_MULTI}/Contents/MacOS/MS2000R
+        COMMAND xattr -cr ${MS2K_MULTI}
+        COMMAND codesign --force --sign - ${MS2K_MULTI}/Contents/Resources/MS2000R_engine
+        COMMAND codesign --force --sign - ${MS2K_MULTI})
+
+    # ... and the Audio Unit the same way (shim/ms2k_au_shim.cpp). Result: build_vst/AU_multi/MS2000R.component
+    add_library(MS2000R_AUShim MODULE shim/ms2k_au_shim.cpp)
+    target_compile_features(MS2000R_AUShim PRIVATE cxx_std_17)
+    set_target_properties(MS2000R_AUShim PROPERTIES CXX_VISIBILITY_PRESET hidden PREFIX "" SUFFIX "" OUTPUT_NAME MS2000R_au_shim)
+    target_link_libraries(MS2000R_AUShim PRIVATE "-framework AudioToolbox" "-framework CoreFoundation")
+    add_dependencies(MS2000R_AUShim MS2000R_VST_AU)
+    set(MS2K_AU_MULTI ${CMAKE_BINARY_DIR}/AU_multi/MS2000R.component)
+    add_custom_command(TARGET MS2000R_AUShim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${MS2K_AU_MULTI}
+        COMMAND ${CMAKE_COMMAND} -E copy_directory $<TARGET_BUNDLE_DIR:MS2000R_VST_AU> ${MS2K_AU_MULTI}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${MS2K_AU_MULTI}/Contents/Resources
+        COMMAND ${CMAKE_COMMAND} -E rename ${MS2K_AU_MULTI}/Contents/MacOS/MS2000R ${MS2K_AU_MULTI}/Contents/Resources/MS2000R_engine
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:MS2000R_AUShim> ${MS2K_AU_MULTI}/Contents/MacOS/MS2000R
+        COMMAND xattr -cr ${MS2K_AU_MULTI}
+        COMMAND codesign --force --sign - ${MS2K_AU_MULTI}/Contents/Resources/MS2000R_engine
+        COMMAND codesign --force --sign - ${MS2K_AU_MULTI})
 endif()

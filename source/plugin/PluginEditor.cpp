@@ -115,8 +115,13 @@ struct DrawBackend final : VPanel::Backend {
 
 juce::Typeface::Ptr loadPanelFace()
 {
-    // the standalone's panel font: a narrow bold sans from Windows (the same files, the same order)
+    // the standalone's panel font: a narrow bold sans from the OS (the same files, the same order - gui_platform_*)
+#ifdef _WIN32
     for (const char* p : { "C:\\Windows\\Fonts\\ARIALNB.TTF", "C:\\Windows\\Fonts\\arialbd.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf" }) {
+#else
+    for (const char* p : { "/System/Library/Fonts/Supplemental/Arial Narrow Bold.ttf", "/Library/Fonts/Arial Narrow Bold.ttf",
+                           "/System/Library/Fonts/Supplemental/Arial Bold.ttf" }) {
+#endif
         juce::MemoryBlock mb;
         if (juce::File(p).loadFileAsData(mb) && mb.getSize() > 0)
             if (auto tf = juce::Typeface::createSystemTypefaceFor(mb.getData(), mb.getSize())) return tf;

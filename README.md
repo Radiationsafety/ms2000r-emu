@@ -5,7 +5,7 @@ the H8S/2350 main CPU runs the original firmware instruction by instruction, and
 original DSP code on the dsp56300 emulator library. Nothing of the synth engine is re-implemented - the sound
 comes from the machine's own code.
 
-Standalone application (Windows, ImGui) with the full MS2000R front panel, and a VST3 instrument plugin (JUCE).
+Standalone application (Windows and macOS, ImGui) with the full MS2000R front panel, and a VST3 instrument plugin (JUCE; on macOS also an Audio Unit).
 
 ## Status
 
@@ -44,7 +44,7 @@ Standalone application (Windows, ImGui) with the full MS2000R front panel, and a
   `Contents\Resources\MS2000R_engine.dll`; every instance after the first runs from its own copy of it in
   `%TEMP%\MS2000R_engines` (removed when the host unloads the plugin), so each instance is a separate machine.
 
-Known limits: Windows only for the GUI and the plugin (Linux: headless build, see below). VSTHost stops calling a plugin that sends SysEx to it (e.g. on leaving the demo songs):
+Known limits: the GUI and the plugin run on Windows and macOS (VST3, and AU on macOS); Linux has a headless build (see below). VSTHost stops calling a plugin that sends SysEx to it (e.g. on leaving the demo songs):
 switch off "MIDI OUT SysEx -> host" in the plugin's Settings there. The emulator needs a recent CPU - it runs about 2x real time on a current desktop; the plugin runs at
 96 kHz with a 128-sample buffer (measured: 0.62 ms median, 0.96 ms worst per 1.33 ms block after the boot).
 Next: a preset library page.
@@ -104,6 +104,54 @@ MS2K_MIDIIN="2:C008;2.3:903C64;3.8:803C00" <repo>/build/ms2000_emulator --headle
 
 `MS2K_MIDIIN` schedules MIDI IN bytes at MCU seconds (`t:hex;t:hex`); `--render-test` writes the DSP's frames
 as a 32-bit WAV. `ctest` in the build folder runs the test suite.
+
+## Build (macOS)
+
+Apple Silicon builds natively (the DSP runs on the dsp56300 library's ARM64 JIT; its output is bit-identical to the
+x64 build). Xcode Command Line Tools, CMake 3.16+ and Ninja (`brew install cmake ninja`); ImGui and GLFW are fetched
+at configure time. If the repository is in a folder iCloud syncs (Desktop, Documents), give the build folder a name
+ending in `.nosync`: iCloud makes "name 2" copies of files a build rewrites, and the build then fails on them.
+
+```
+cmake -S . -B build.nosync -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build.nosync --target MS2000R_app
+```
+
+`build.nosync/MS2000R.app` is the standalone with the front panel (GLFW + Metal). Put it in the folder with the ROMs, or
+anywhere - on its first start it asks for that folder and remembers it
+(`~/Library/Application Support/MS2000R/home.txt`); `~/Documents/MS2000R` is found by itself. Its output goes to
+`ms2000_gui.log` there. From a terminal the same executable runs headless:
+
+```
+cd <folder with the ROMs> && <repo>/build.nosync/ms2000_emulator --headless --selftest-full
+<repo>/build.nosync/ms2000_emulator --gui
+<repo>/build.nosync/ms2000_emulator --list-midi
+<repo>/build.nosync/ms2000_emulator --play --midi-in "<part of a MIDI port's name>" --midi-out "<part of a name>"
+```
+
+`--play` runs the machine on the default audio output without the panel (`--audio-device <name>` picks another,
+`--volume 0..1` is the VOLUME pot, default 0.7) until Ctrl+C; every panel pot stands at its centre. The firmware
+boots in about 3 s, muted - a note sent before that is not heard (the `MS2K_MIDIIN` example above plays during the
+boot; use `4.0:903C64;6.0:803C00` with `--duration 8`). AUDIO IN 1/2 (vocoder, OSC1 AUDIO IN) are chosen in the GUI: an
+interface with more than two inputs is listed as stereo pairs ("IN 3-4"), and macOS asks once for the microphone
+permission.
+`-DCMAKE_OSX_ARCHITECTURES=x86_64` builds the x64 version, which runs under Rosetta 2.
+
+The plugin, VST3 and Audio Unit (JUCE is fetched at configure time; the pinned JUCE is patched for the macOS 15+
+SDK, `cmake/macos/juce_patch.cmake`):
+
+```
+cmake -S . -B build_vst.nosync -G Ninja -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON
+cmake --build build_vst.nosync --target MS2000R_Shim MS2000R_AUShim
+cp -R build_vst.nosync/VST3_multi/MS2000R.vst3 ~/Library/Audio/Plug-Ins/VST3/
+cp -R build_vst.nosync/AU_multi/MS2000R.component ~/Library/Audio/Plug-Ins/Components/
+```
+
+Both bundles carry a loader module and the engine, as on Windows: every instance after the first runs from its own
+copy of the engine in `$TMPDIR`, so several instances in one host are separate machines (AU: Logic, GarageBand).
+They are ad-hoc signed - fine for your own builds; to pass them to other Macs they need a Developer ID signature
+and notarization. The plugin finds the MS2000 folder as on Windows (`MS2K_HOME`, the folder chosen in Settings,
+`~/Documents/MS2000R`, the folders above the plugin).
 
 VST3 plugin (JUCE is fetched at configure time):
 

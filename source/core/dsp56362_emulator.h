@@ -31,7 +31,15 @@
 //   * PORT_RESET (the DSP's RESET) is not yet driven by the MCU port that owns it.
 #include <atomic>
 #include "ak4522.h"
+// MAC-1: the spin-wait hint of the queue below - PAUSE on x86, YIELD on arm64.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#define MS2K_CPU_RELAX() _mm_pause()
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define MS2K_CPU_RELAX() __asm__ __volatile__("yield")
+#else
+#define MS2K_CPU_RELAX() ((void)0)
+#endif
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -113,7 +121,7 @@ public:
     bool threaded() const { return m_thr.joinable(); }
     void drain() {
         const uint32_t h = m_qHead.load(std::memory_order_relaxed);
-        while (m_qDone.load(std::memory_order_acquire) != h) _mm_pause();
+        while (m_qDone.load(std::memory_order_acquire) != h) MS2K_CPU_RELAX();
     }
     uint64_t m_syncCalls = 0, m_syncRuns = 0, m_fsRuns = 0;
     void flushPend() { if (m_pendMcu) { ++m_syncRuns; const uint32_t p = m_pendMcu; m_pendMcu = 0; post(p, m_pendHz); } }
@@ -121,7 +129,7 @@ public:
         if (!m_thr.joinable()) { runForMcuCycles(mcuCycles, mcuHz); return; }
         if (mcuHz) m_fsShadow = (m_fsShadow + uint64_t(mcuCycles) * 48000u) % mcuHz;
         const uint32_t h = m_qHead.load(std::memory_order_relaxed);
-        while (h - m_qDone.load(std::memory_order_acquire) >= kQ) _mm_pause();
+        while (h - m_qDone.load(std::memory_order_acquire) >= kQ) MS2K_CPU_RELAX();
         m_q[h & (kQ - 1)] = { mcuCycles, mcuHz };
         m_qHead.store(h + 1, std::memory_order_release);
         if (m_thrSleeping.load(std::memory_order_acquire)) { std::lock_guard<std::mutex> l(m_thrMx); m_thrCv.notify_one(); }

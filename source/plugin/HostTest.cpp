@@ -366,6 +366,11 @@ int main(int argc, char** argv)
         size_t overLate = 0; double maxLate = 0; const size_t skip = size_t(3.0 * rate / block);
         for (size_t i = skip; i < g_blockMs.size(); ++i) { overLate += g_blockMs[i] > dur; maxLate = std::max(maxLate, g_blockMs[i]); }
         std::cout << " (after the first 3 s: " << overLate << ", max " << maxLate << " ms)";
+        if (const char* bl = std::getenv("MS2K_BLOCKLOG"))   // MAC-4: every block's cost - "<s of audio> <ms>"
+            if (FILE* f = std::fopen(bl, "w")) {
+                for (size_t i = 0; i < g_blockMs.size(); ++i) std::fprintf(f, "%.3f %.3f\n", double(i) * block / rate, g_blockMs[i]);
+                std::fclose(f);
+            }
     }
 #ifdef _WIN32
     {   // DSP-THREAD b: the whole process' CPU time (all threads) against the audio played

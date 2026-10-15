@@ -1,5 +1,4 @@
 #include "h8s2350_emulator.h"
-#include <immintrin.h>
 #include <algorithm>
 #include <iostream>
 
@@ -114,6 +113,7 @@ void H8S2350Emulator::processEnhancedSIMDInstructions(const uint8_t* instruction
         return;
     }
     
+#ifdef MS2K_HAVE_AVX2   // MAC-1: no scalar version - nothing enables these optimizations
     // Process 64 instructions with true vectorization
     for (size_t i = 0; i < 64; i += 8) {
         // Load 8 instructions into SIMD register
@@ -152,6 +152,10 @@ void H8S2350Emulator::processEnhancedSIMDInstructions(const uint8_t* instruction
         // Store processed instructions back
         _mm256_store_si256((__m256i*)&instructions[i], processed_vector);
     }
+#else
+    (void)instructions; (void)opcode_types;
+#endif
+    (void)pc_offsets;
 }
 
 // Internal SIMD instruction processing (legacy)
@@ -160,8 +164,6 @@ void H8S2350Emulator::processSIMDInstructions(const uint8_t* instructions, uint3
         return;
     }
     
-    // Load 32 instructions into SIMD register
-    __m256i instruction_vector = _mm256_load_si256((__m256i*)instructions);
     
     // Process instructions with vectorized operations
     for (size_t i = 0; i < 32; ++i) {

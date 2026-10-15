@@ -10,6 +10,16 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(KorgMS2000 VERSION 0.9.8 LANGUAGES CXX)
+
+# MAC-4: a plugin lives in a host that has its own JUCE (or its own anything), and macOS coalesces every exported
+# weak symbol across the loaded images - the host's and the plugin's JUCE then ran each other's inline code (measured:
+# a ValueTree freed with the wrong allocator in getStateInformation). Nothing but the entry points is exported.
+if(APPLE)
+    set(CMAKE_C_VISIBILITY_PRESET hidden)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+endif()
 add_compile_definitions(MS2K_VERSION="${PROJECT_VERSION}")   # PUBLIC-1b: shown in the GUI title and the plugin
 
 # Enable testing support for CTest
@@ -54,11 +64,21 @@ if(NOT WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 endif()
 if(NOT MSVC)
-    add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/source/core/platform_compat.h)
+    # C++ only (MAC-3: GLFW is C)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX,OBJCXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/source/core/platform_compat.h>")
     # The sources use 256-bit AVX/AVX2 intrinsics (h8s2350_emulator.h, h8s2350_simd_optimizations).
     # MSVC emits them without a switch; GCC/Clang need the target enabled. Same CPU requirement as
-    # the Windows build.
-    add_compile_options(-mavx2)
+    # the Windows build. MAC-1: arm64 (Apple Silicon) takes the scalar paths instead.
+    # On macOS the target is CMAKE_OSX_ARCHITECTURES when set (an x86_64 build on Apple Silicon runs
+    # under Rosetta 2), else the host.
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(MS2K_TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(MS2K_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    if(MS2K_TARGET_ARCH MATCHES "x86_64|AMD64|i[3-6]86")
+        add_compile_options(-mavx2)
+    endif()
 endif()
 
 # Include directories
@@ -196,6 +216,17 @@ if(MSVC)
     target_compile_options(ms2000 PRIVATE $<$<CONFIG:Release>:/GL /GS->)
     set_property(TARGET ms2000 APPEND PROPERTY STATIC_LIBRARY_OPTIONS $<$<CONFIG:Release>:/LTCG>)
     target_link_options(ms2000 INTERFACE $<$<CONFIG:Release>:/LTCG>)
+elseif(APPLE)
+    # MAC-1: the same for Apple Clang - ThinLTO across the core and the executables linking it.
+    # -mcpu=apple-m1 is the oldest Apple Silicon core, so the binary runs on every M-series Mac.
+    option(MS2K_MAC_LTO "ThinLTO for the macOS Release build" ON)
+    if(MS2K_MAC_LTO)
+        target_compile_options(ms2000 PUBLIC $<$<CONFIG:Release>:-flto=thin>)
+        target_link_options(ms2000 INTERFACE $<$<CONFIG:Release>:-flto=thin>)
+    endif()
+    if(MS2K_TARGET_ARCH MATCHES "arm64|aarch64")
+        target_compile_options(ms2000 PUBLIC -mcpu=apple-m1)
+    endif()
 endif()
 
 # MS2000 library properties
@@ -224,6 +255,17 @@ if(MSVC)
     target_link_options(ms2000_emulator PRIVATE /OPT:NOREF /MAP)   # PERF-124: map for the sampling profiler
 endif()
 
+# MAC-2: --play - CoreAudio output and CoreMIDI in/out (source/audio/host_io_mac.cpp)
+if(APPLE)
+    target_sources(ms2000_emulator PRIVATE
+        source/audio/host_io_mac.cpp
+        source/standalone/play_mode.cpp
+    )
+    target_compile_definitions(ms2000_emulator PRIVATE MS2K_HOST_IO)
+    target_link_libraries(ms2000_emulator
+        "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreMIDI" "-framework CoreFoundation")
+endif()
+
 # fw28.txt: Try to add ImGui Win32/DX11 support for GUI mode
 if(WIN32)
     find_package(imgui CONFIG QUIET)
@@ -233,6 +275,7 @@ if(WIN32)
             source/gui/gui_win32_dx11.cpp
             source/gui/panel_widgets.cpp
             source/gui/thin_gui.cpp
+            source/gui/gui_platform_win32_dx11.cpp
             source/audio/host_io_win.cpp
         )
         target_link_libraries(ms2000_emulator imgui::imgui d3d11 dxgi comdlg32)
@@ -240,6 +283,54 @@ if(WIN32)
         message(STATUS "MS2000 Emulator with ImGui GUI support will be built")
     else()
         message(STATUS "ImGui not found - GUI mode will be disabled, fallback to headless")
+        target_compile_definitions(ms2000_emulator PRIVATE GUI_DISABLED)
+    endif()
+elseif(APPLE)
+    # MAC-3: the thin GUI on GLFW + Metal. ImGui and GLFW are fetched at configure time (as JUCE is for the plugin).
+    option(MS2K_MAC_GUI "Build the standalone GUI on macOS (fetches ImGui and GLFW)" ON)
+    if(MS2K_MAC_GUI)
+        enable_language(OBJCXX)
+        include(FetchContent)
+        FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.92.9 GIT_SHALLOW TRUE)
+        FetchContent_Declare(glfw GIT_REPOSITORY https://github.com/glfw/glfw.git GIT_TAG 3.4 GIT_SHALLOW TRUE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(glfw imgui)   # imgui has no CMakeLists: this only fetches it
+        add_library(ms2k_imgui STATIC
+            ${imgui_SOURCE_DIR}/imgui.cpp
+            ${imgui_SOURCE_DIR}/imgui_draw.cpp
+            ${imgui_SOURCE_DIR}/imgui_tables.cpp
+            ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
+        )
+        target_include_directories(ms2k_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+        target_link_libraries(ms2k_imgui PUBLIC glfw "-framework Metal" "-framework QuartzCore")
+        set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_sources(ms2000_emulator PRIVATE
+            source/gui/thin_gui.cpp
+            source/gui/gui_platform_mac.mm
+        )
+        set_source_files_properties(source/gui/gui_platform_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(ms2000_emulator ms2k_imgui
+            "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework UniformTypeIdentifiers")
+        target_compile_definitions(ms2000_emulator PRIVATE IMGUI_ENABLED)
+        message(STATUS "MS2000 Emulator with the ImGui GUI (GLFW + Metal) will be built")
+
+        # MS2000R.app: the same executable in a bundle (started from Finder it opens the GUI). Ad-hoc signed.
+        set(MS2K_APP "${CMAKE_BINARY_DIR}/MS2000R.app")
+        configure_file(cmake/macos/Info.plist.in "${CMAKE_BINARY_DIR}/Info.plist" @ONLY)
+        add_custom_target(MS2000R_app
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${MS2K_APP}/Contents/MacOS"
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ms2000_emulator>" "${MS2K_APP}/Contents/MacOS/ms2000_emulator"
+            COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/Info.plist" "${MS2K_APP}/Contents/Info.plist"
+            COMMAND xattr -cr "${MS2K_APP}"   # codesign refuses extended attributes ("detritus")
+            COMMAND codesign --force --sign - "${MS2K_APP}"
+            DEPENDS ms2000_emulator
+            COMMENT "Assembling MS2000R.app")
+    else()
         target_compile_definitions(ms2000_emulator PRIVATE GUI_DISABLED)
     endif()
 else()
@@ -686,8 +777,12 @@ option(MS2K_BUILD_VST3 "Build the MS2000R VST3 plugin (JUCE)" OFF)
 if(MS2K_BUILD_VST3)
     include(FetchContent)
     # the JUCE fork gearmulator builds with (JUCE 7.0.10)
+    if(APPLE)   # MAC-4: one call the macOS 15+ SDK no longer has (cmake/macos/juce_patch.cmake)
+        set(MS2K_JUCE_PATCH PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/juce_patch.cmake)
+    endif()
     FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/dsp56300/JUCE.git
-                              GIT_TAG bf39bb3916cf6e5858a53831440eb1e58e5fb095)
+                              GIT_TAG bf39bb3916cf6e5858a53831440eb1e58e5fb095
+                              ${MS2K_JUCE_PATCH})
     FetchContent_MakeAvailable(JUCE)
     add_subdirectory(source/plugin)
 endif()

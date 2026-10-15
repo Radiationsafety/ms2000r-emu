@@ -1,0 +1,92 @@
+diff --git a/source/dsp56kEmu/jitmem.cpp b/source/dsp56kEmu/jitmem.cpp
+--- a/source/dsp56kEmu/jitmem.cpp
++++ b/source/dsp56kEmu/jitmem.cpp
+@@ -13,6 +13,34 @@
+ 
+ namespace dsp56k
+ {
++	// MS2000 MAC-1: the flags for "_offset >= _value". ARM64 cmp only takes a 12-bit immediate (optionally
++	// shifted by 12), so the memory size $1000000 - also the default bridged address - does not encode,
++	// and asmjit drops the instruction. For a power of two the same test is "any bit at or above it set",
++	// an encodable logical immediate; the caller branches/selects on the condition returned.
++#ifdef HAVE_ARM64
++	static asmjit::arm::CondCode cmpGreaterEqual(JitEmitter& _a, const JitRegGP& _offset, const TWord _value)
++	{
++		if(_value >= 0x1000 && (_value & (_value - 1)) == 0)
++		{
++			_a.test_(r32(_offset), asmjit::Imm(~(_value - 1)));
++			return asmjit::arm::CondCode::kNE;
++		}
++		_a.cmp(r32(_offset), asmjit::Imm(_value));
++		return asmjit::arm::CondCode::kGE;
++	}
++#endif
++
++	// "if(_offset >= _size) goto _skip"
++	static void jumpIfOutOfRange(JitEmitter& _a, const JitRegGP& _offset, const TWord _size, const asmjit::Label& _skip)
++	{
++#ifdef HAVE_ARM64
++		_a.b(cmpGreaterEqual(_a, _offset, _size), _skip);
++#else
++		_a.cmp(r32(_offset), asmjit::Imm(_size));
++		_a.jge(_skip);
++#endif
++	}
++
+ 	void Jitmem::mov(uint32_t* _dst, const uint32_t& _imm) const
+ 	{
+ #ifdef HAVE_X86_64
+@@ -329,8 +357,7 @@
+ 			else
+ #endif
+ 			{
+-				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().size(_area)));
+-				m_block.asm_().jge(skip.get());
++				jumpIfOutOfRange(m_block.asm_(), _offset, static_cast<TWord>(m_block.dsp().memory().size(_area)), skip.get());
+ 			}
+ 		}
+ 		readDspMemory(_dst, p);
+@@ -364,8 +391,7 @@
+ 			else
+ #endif
+ 			{
+-				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().sizeXY()));
+-				m_block.asm_().jge(skip.get());
++				jumpIfOutOfRange(m_block.asm_(), _offset, static_cast<TWord>(m_block.dsp().memory().sizeXY()), skip.get());
+ 			}
+ 		}
+ 
+@@ -519,8 +545,7 @@
+ 
+ 			if(!hasMmuSupport())
+ 			{
+-				m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().size(_area)));
+-				m_block.asm_().jge(skip.get());
++				jumpIfOutOfRange(m_block.asm_(), _offset, static_cast<TWord>(m_block.dsp().memory().size(_area)), skip.get());
+ 			}
+ 
+ 			writeDspMemory(p, _src);
+@@ -557,8 +582,7 @@
+ 
+ 		if(!hasMmuSupport())
+ 		{
+-			m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().sizeXY()));
+-			m_block.asm_().jge(skip.get());
++			jumpIfOutOfRange(m_block.asm_(), _offset, static_cast<TWord>(m_block.dsp().memory().sizeXY()), skip.get());
+ 		}
+ 
+ 		DspValue tempXY(m_block);
+@@ -1227,10 +1251,11 @@
+ 			m_block.asm_().lea_(gpXY, gpP, pointerOffset(hostPtrXY, hostPtrP));
+ 		}
+ 
+-		m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().getBridgedMemoryAddress()));
+ #ifdef HAVE_ARM64
+-		m_block.asm_().csel(r64(gpXY), r64(gpP), r64(gpXY), asmjit::arm::CondCode::kGE);
++		const auto ge = cmpGreaterEqual(m_block.asm_(), _offset, m_block.dsp().memory().getBridgedMemoryAddress());
++		m_block.asm_().csel(r64(gpXY), r64(gpP), r64(gpXY), ge);
+ #else
++		m_block.asm_().cmp(r32(_offset), asmjit::Imm(m_block.dsp().memory().getBridgedMemoryAddress()));
+ 		m_block.asm_().cmovge(r64(gpXY), r64(gpP));
+ #endif
+ 

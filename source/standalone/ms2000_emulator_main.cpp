@@ -11,9 +11,13 @@
 #include "../tests/snapshot_golden_master_test.h"  // fw27.txt: Golden master testing
 #include "../core/soak_test_monitor.h"  // fw27.txt: Long-run soak testing
 #include "../core/panel_timeline_visualizer.h"  // fw27.txt: Panel timeline & LCD diff visualization
+#ifdef MS2K_HOST_IO
+#include "play_mode.h"  // MAC-2: --play
+#endif
 #ifdef IMGUI_ENABLED
 #include "../gui/gui_win32_dx11.h"  // fw28.txt: Win32/DX11 GUI
 #include "../gui/thin_gui.h"
+#include "../gui/gui_platform.h"    // MAC-3: chooseFolder / alert
 #endif
 #include <iostream>
 #include <string>
@@ -23,6 +27,7 @@
 #include <vector>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>  // std::clamp
 #include <cstdlib>   // rand
 #include <iomanip>   // std::setw, std::setfill
@@ -64,6 +69,11 @@ struct CliConfig {
     std::string record = "";
     std::string replay = "";
     std::string renderTest = "";   // ENGINE-BLOCK: --render-test <out.wav> (headless, manual mode, --duration = emulated s)
+    // MAC-2: --play - the machine on the host audio device / MIDI ports (--midi-in, --midi-out), no GUI
+    bool play = false;
+    std::string audioDevice = "";
+    float volume = 0.7f;
+    bool durationGiven = false;
     RunMode mode = RunMode::HEADLESS;
     int durationSec = 5;
     bool help = false;
@@ -161,6 +171,10 @@ static void showHelp() {
     std::cout << "  --diag                Show diagnostic panel (developer radar)\n";
     std::cout << "  --mmcss               Enable Windows MMCSS Pro Audio priority\n";
     std::cout << "  --cycles              Show cycle count summary at end (P1 Cycle Model)\n";
+    std::cout << "  --play                Play through the host audio device; --midi-in/--midi-out <name> connect MIDI\n";
+    std::cout << "                        (runs until Ctrl+C, or --duration seconds)\n";
+    std::cout << "  --audio-device <name> Audio output for --play (part of its name; default: the system output)\n";
+    std::cout << "  --volume <0-1>        The VOLUME pot for --play (default: 0.7)\n";
     std::cout << "  --audio               Enable I2S/AK4522 audio pipeline\n";
     std::cout << "  --sample-rate <hz>    Audio sample rate (default: 48000)\n";
     std::cout << "  --buffer-frames <n>   Audio buffer size in frames (default: 256)\n";
@@ -240,12 +254,20 @@ static CliConfig parseArgs(int argc, char** argv) {
             config.renderTest = argv[++i];
         } else if ((arg == "--duration" || arg == "-d") && i + 1 < argc) {
             config.durationSec = parseIntArg(argv[++i], config.durationSec);
+            config.durationGiven = true;
         } else if (arg == "--diag") {
             config.showDiag = true;
         } else if (arg == "--mmcss") {
             config.useMmcss = true;
         } else if (arg == "--cycles") {
             config.cycles = true;
+        } else if (arg == "--play") {
+            config.play = true;
+            config.mode = RunMode::HEADLESS;
+        } else if (arg == "--audio-device" && i + 1 < argc) {
+            config.audioDevice = argv[++i];
+        } else if (arg == "--volume" && i + 1 < argc) {
+            config.volume = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f);
         } else if (arg == "--audio") {
             config.audio = true;
         } else if (arg == "--sample-rate" && i + 1 < argc) {
@@ -521,12 +543,44 @@ static int runSelftest(const std::string& romPath, const CliConfig& config) {
 #if defined(_WIN32) && !defined(_WINDOWS_)
 extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void* module, wchar_t* name, unsigned long size);
 #endif
-static void ms2kFindHome() {
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <unistd.h>
+// MAC-3: the executable's path, and whether it runs from an app bundle (Finder: no arguments, cwd = /).
+static std::filesystem::path ms2kExePath() {
+    char buf[4096]; uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) != 0) return {};
+    std::error_code ec; const auto p = std::filesystem::canonical(buf, ec);
+    return ec ? std::filesystem::path(buf) : p;
+}
+static bool ms2kInAppBundle() { return ms2kExePath().string().find(".app/Contents/MacOS/") != std::string::npos; }
+// The folder the user chose once (GUI), as the plugin keeps it on Windows (%APPDATA%\MS2000R\home.txt).
+static std::filesystem::path ms2kHomeTxt() {
+    const char* h = std::getenv("HOME");
+    return h ? std::filesystem::path(h) / "Library" / "Application Support" / "MS2000R" / "home.txt" : std::filesystem::path();
+}
+#endif
+static bool ms2kHomeOk(const std::filesystem::path& d) { return ms2k::hasRoms(d); }   // ROM-PATHS-1: every boot-ROM folder variant
+static bool ms2kFindHome() {
     namespace fs = std::filesystem;
-    auto ok = [](const fs::path& d) { return ms2k::hasRoms(d); };   // ROM-PATHS-1
+    auto ok = ms2kHomeOk;
     fs::path home;
     if (const char* e = std::getenv("MS2K_HOME"); e && *e && ok(fs::path(e))) home = e;
-    else if (ok(fs::current_path())) return;
+    else if (ok(fs::current_path())) return true;
+#ifdef __APPLE__
+    else {   // MAC-3: the folders above the executable (an MS2000R.app put in the ROM folder), the remembered
+             // folder, ~/Documents/MS2000R
+        for (fs::path d = ms2kExePath().parent_path(); !d.empty(); d = d.parent_path()) {
+            if (ok(d)) { home = d; break; }
+            if (d == d.root_path()) break;
+        }
+        if (home.empty()) {
+            std::ifstream f(ms2kHomeTxt()); std::string line;
+            if (std::getline(f, line) && ok(fs::path(line))) home = line;
+        }
+        if (home.empty()) if (const char* h = std::getenv("HOME")) if (ok(fs::path(h) / "Documents" / "MS2000R")) home = fs::path(h) / "Documents" / "MS2000R";
+    }
+#endif
 #ifdef _WIN32
     else {
         // (not _get_wpgmptr: with a narrow main() it is unset and the CRT's invalid-parameter check ends the process)
@@ -541,15 +595,39 @@ static void ms2kFindHome() {
     if (home.empty()) {   // ROM-PATHS-1: say what is missing where, instead of failing later without a word
         std::cout << "[HOME] no MS2000 folder found (MS2K_HOME, the current folder, the exe's folder and the ones above it). "
                   << "Missing in " << fs::current_path().string() << ": " << ms2k::missingRoms(fs::current_path()) << std::endl;
-        return;
+        return false;
     }
     std::error_code ec; fs::current_path(home, ec);
     std::cout << "[HOME] " << home.string() << std::endl;
+    return true;
 }
 
 int main(int argc, char** argv) {
-    ms2kFindHome();
+    const bool homeFound = ms2kFindHome();
     auto config = parseArgs(argc, argv);
+#if defined(__APPLE__) && defined(IMGUI_ENABLED)
+    // MAC-3: MS2000R.app from Finder = the GUI, its output in ms2000_gui.log (as "MS2000R (log).bat" on Windows).
+    // No ROM folder found: ask for it once and remember it.
+    if (ms2kInAppBundle() && argc == 1) config.mode = RunMode::GUI;
+    if (config.mode == RunMode::GUI && !homeFound) {
+        namespace fs = std::filesystem;
+        for (;;) {
+            std::string dir;
+            if (!GuiPlatform::chooseFolder("Choose the MS2000 folder - the one holding flash.bin and full FW/boot-362.bin", dir)) return 2;
+            if (ms2kHomeOk(dir)) {
+                std::error_code ec; fs::create_directories(ms2kHomeTxt().parent_path(), ec);
+                std::ofstream(ms2kHomeTxt()) << dir << "\n";
+                fs::current_path(dir, ec);
+                break;
+            }
+            GuiPlatform::alert("Not an MS2000 folder", "That folder has no flash.bin and full FW/boot-362.bin.");
+        }
+    }
+    if (config.mode == RunMode::GUI && ms2kInAppBundle() && argc == 1) {
+        if (std::freopen("ms2000_gui.log", "w", stdout)) dup2(fileno(stdout), fileno(stderr));   // one file, one offset
+        std::cout << "[HOME] " << std::filesystem::current_path().string() << std::endl;
+    }
+#endif
     
     // Sprint 1.4: Set global cycle reporting flag
     g_printCycles = config.cycles;
@@ -689,6 +767,12 @@ int main(int argc, char** argv) {
     }
 
     // fw27.txt Phase 2: Handle MIDI device listing
+#ifdef MS2K_HOST_IO
+    if (config.listMidiDevices) {   // MAC-2: the real devices
+        MS2000::listHostDevices();
+        return 0;
+    }
+#endif
     if (config.listMidiDevices) {
         std::cout << "fw27.txt: Available MIDI devices...\n";
         
@@ -1284,6 +1368,16 @@ int main(int argc, char** argv) {
         return 2;  // I/O error
     }
 
+#ifdef MS2K_HOST_IO
+    if (config.play) {
+        MS2000::PlayOptions po;
+        po.audioDevice = config.audioDevice; po.midiIn = config.midiInDevice; po.midiOut = config.midiOutDevice;
+        po.volume = config.volume; po.durationSec = config.durationGiven ? config.durationSec : 0;
+        return MS2000::runPlayMode(runner, po);
+    }
+#else
+    if (config.play) { std::cerr << "ERROR: --play is not available in this build (no host audio backend)\n"; return 2; }
+#endif
     // ENGINE-BLOCK (VST3 phase 0): the machine driven block by block from here, as a plugin host would - no CPU
     // thread. Blocks of pseudo-random length 16..1024 frames (a fixed LCG, so every run is the same); the frames are
     // written as a 32-bit WAV in the MS2K_DSPWAV format, so the two files can be compared frame for frame.
