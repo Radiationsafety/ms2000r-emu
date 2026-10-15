@@ -83,7 +83,7 @@ struct CgRom { bool ok = false; uint8_t d[256][8]{}; };
 CgRom loadCgRom()
 {
     CgRom r;
-    for (const char* p : { "hd44780_a00.bin", "..\\hd44780_a00.bin", "..\\..\\hd44780_a00.bin" }) {
+    for (const char* p : { "hd44780_a00.bin", "full FW/hd44780_a00.bin", "Full FW/hd44780_a00.bin", "..\\hd44780_a00.bin", "..\\..\\hd44780_a00.bin" }) {   // ROM-PATHS-1
         std::ifstream f(p, std::ios::binary);
         if (!f) continue;
         std::vector<char> b((std::istreambuf_iterator<char>(f)), {});

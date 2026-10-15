@@ -98,6 +98,9 @@ namespace dsp56k
 		uint64_t hrxEmptyReads() const				{ return m_hrxEmpty; }
 		uint32_t rxMaxFill() const					{ return m_rxMaxFill; }
 		uint32_t rxCount() const					{ return m_rxCount; }
+		// MS2000 VOC-DEATH-3 diagnostics: DSP cycle of the last HTX write and of the last HRX read
+		uint64_t htxWriteCycle() const				{ return m_htxWriteCycle; }
+		uint64_t hrxReadCycle() const				{ return m_hrxReadCycle; }
 
 		void setCallbackTx(CallbackTx&& _cb)		{ m_callbackTx = std::move(_cb); }
 
@@ -118,6 +121,7 @@ namespace dsp56k
 		std::array<TWord, FifoSizeLarge> m_rx{};
 		uint32_t m_rxCount = 0;
 		uint64_t m_hrxReads = 0, m_hrxEmpty = 0; uint32_t m_rxMaxFill = 0;
+		uint64_t m_htxWriteCycle = 0, m_hrxReadCycle = 0;
 
 		CallbackTx m_callbackTx;
 	};

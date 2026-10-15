@@ -164,6 +164,7 @@ namespace dsp56k
 		m_instructions = instructions;
 		m_cycles = cycles;
 		m_pendingInterrupts.clear();
+		m_jitIrqCheck = 0;
 		m_processingMode = Default;
 		m_interruptFunc = m_execPeripheralsFunc;
 	}
@@ -213,6 +214,11 @@ namespace dsp56k
 	{
 		pcCurrentInstruction = vba;
 		m_processingMode = FastInterrupt;
+		if(vba < 256) ++m_intTaken[vba];	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector
+		{	static const int s_latN = [] { const char* e = std::getenv("MS2K_IRQBLAT"); return e ? std::atoi(e) : 0; }();
+			static int s_seen = 0;
+			if(s_latN && vba == 0x12 && m_cycles > 300000000ull && s_seen < s_latN) { ++s_seen;
+				printf("[IRQBLAT] taken  c=%llu SR=%06X\n", (unsigned long long)m_cycles, reg.sr.var); } }
 
 #if DSP56300_DEBUGGER
 		if(m_debugger)
@@ -223,7 +229,9 @@ namespace dsp56k
 		{
 			LOGJITPC(vba);
 			const auto pc = getPC();
-			m_jit.getTrampoline().execOne(&reg, vba, m_jitEntries[vba]);
+			// 2026-10-12: one-shot ISR entry; with the nesting fix funcCreate compiles but does not run,
+			// so re-read the entry and run the fresh block (see execOneEnsureRun in dsp.h)
+			execOneEnsureRun(vba);
 			if(m_processingMode != LongInterrupt)
 			{
 				m_processingMode = DefaultPreventInterrupt;
@@ -357,6 +365,9 @@ namespace dsp56k
 		if(best >= m_pendingInterrupts.size())
 		{
 			// Nothing may be taken now. The requests wait, and the peripherals keep their clock meanwhile.
+			// VOC-DEATH-3b: what waits is masked; only an SR change can free it, and every SR/MR write ends a
+			// JIT block without a link (mode change), so linked chains need not hand back for it.
+			m_jitIrqCheck = 0;
 			if(m_pendingInterrupts.empty())
 				m_interruptFunc = m_execPeripheralsFunc;
 			m_execPeripheralsFunc(this);
@@ -381,6 +392,9 @@ namespace dsp56k
 
 		m_processingMode = FastInterrupt;
 		m_pendingInterrupts.pop_front();
+		// VOC-DEATH-3b: m_jitIrqCheck is NOT cleared here. Measured: clearing it when the last request is taken let
+		// [JOBLEN] jobs run past the fs period again (2-7 % > 2083 cycles, 30 s walk) - only the dispatcher's
+		// "nothing takeable" clears it.
 
 		execInterrupt(vba);
 	}
@@ -1433,6 +1447,19 @@ namespace dsp56k
 			return true;
 
 		m_pendingInterrupts.push_back({_interruptVectorAddress});
+		m_jitIrqCheck = 1;	// VOC-DEATH-3b: linked chains hand back to the dispatcher until it has looked at it
+
+		// MS2000 VOC-DEATH-3 diagnostic (MS2K_IRQBLAT=<n>, after 3e8 cycles): the state an IRQB request meets
+		static const int s_latN = [] { const char* e = std::getenv("MS2K_IRQBLAT"); return e ? std::atoi(e) : 0; }();
+		static int s_latSeen = 0;
+		if(s_latN && _interruptVectorAddress == 0x12 && m_cycles > 300000000ull && s_latSeen < s_latN)
+		{
+			++s_latSeen;
+			const int kind = m_interruptFunc == m_execPeripheralsFunc ? 0 : m_interruptFunc == &dspExecInterrupts ? 1
+						   : m_interruptFunc == &dspExecDefaultPreventInterrupt ? 2 : m_interruptFunc == &dspExecNop ? 3 : 4;
+			printf("[IRQBLAT] inject c=%llu PC=%06X SR=%06X mode=%d func=%d pending=%u\n", (unsigned long long)m_cycles,
+				   pcCurrentInstruction, reg.sr.var, int(m_processingMode), kind, unsigned(m_pendingInterrupts.size()));
+		}
 
 		if(m_interruptFunc == m_execPeripheralsFunc)
 			m_interruptFunc = &dspExecInterrupts;

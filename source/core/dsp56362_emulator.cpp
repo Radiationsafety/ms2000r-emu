@@ -18,6 +18,7 @@
 #include <iterator>
 #include <vector>
 #include <map>
+#include "rom_paths.h"
 #include <algorithm>
 #include "crash_handlers.h"
 
@@ -27,6 +28,7 @@ namespace {
 struct DspRingEntry { uint32_t pc, sr, sp, lc, mode, fifo; unsigned long long cyc; };
 constexpr unsigned kDspRingN = 8192;
 DspRingEntry g_dspRing[kDspRingN]; unsigned g_dspRingI = 0; bool g_dspRingOn = false;
+unsigned long long g_edgeCyc[8] = {}; unsigned g_edgeI = 0;   // VOC-DEATH-3: last IRQB injections (DSP cycles)
 const dsp56k::SHI* g_ringShi = nullptr; const unsigned long long* g_ringWordsIn = nullptr; const unsigned long long* g_ringOverruns = nullptr;
 void dumpDspRing()
 {
@@ -258,7 +260,10 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
     }
 
     const char* env = std::getenv("MS2K_DSPROM");
-    std::string path = (env && *env) ? env : "full FW/boot-362.ms2000.bin";
+    // ROM-PATHS-1: beside flash.bin or in "full FW", the corrected copy first (rom_paths.h)
+    std::string path = (env && *env) ? std::string(env) : ms2k::findBootRom(".");
+    if (path.empty()) path = "full FW/boot-362.bin";   // for the "not found" message only
+    const bool publicDump = !(env && *env) && path.size() >= 12 && path.compare(path.size() - 12, 12, "boot-362.bin") == 0;
     auto readAll = [](const std::string& p) {
         std::ifstream f(p, std::ios::binary);
         return std::vector<uint8_t>{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
@@ -270,9 +275,7 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
     // MS2000 board (KOD-A30412: mode 5, SPI) require $FF0019 - see CLAUDE.md "VALIDATION". So with no
     // corrected copy present, the public dump is read and THOSE TWO WORDS ONLY are corrected in memory,
     // and only if they hold the dump's value; the file on disk is never touched. MS2K_DSPROM stays literal.
-    if (rom.empty() && !(env && *env)) {
-        path = "full FW/boot-362.bin";
-        rom = readAll(path);
+    if (publicDump && !rom.empty()) {
         auto word = [&](size_t w) { return uint32_t(rom[w * 4]) | uint32_t(rom[w * 4 + 1]) << 8 | uint32_t(rom[w * 4 + 2]) << 16; };
         if (rom.size() == 768 && word(0x17) == 0xFF0018 && word(0x2D) == 0xFF0018) {
             rom[0x17 * 4] = 0x19; rom[0x2D * 4] = 0x19;
@@ -281,7 +284,7 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
     }
     if (rom.size() != 768) {
         printf("[DSP56362] NOT BUILT - boot ROM '%s' %s (need 768 bytes = 192 words x 4, LE). "
-               "The ROM is local-only; see CLAUDE.md 'THE VINTAGE BOOT ROM'.\n",
+               "Put boot-362.bin beside flash.bin or in its 'full FW' subfolder (no sound without it).\n",
                path.c_str(), rom.empty() ? "not found" : "has the wrong size");
         return false;
     }
@@ -443,6 +446,27 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
     m_periphX->getHDI08().setWriteHDRCallback([this](dsp56k::TWord v) {
         const bool pb0 = (v & 1) != 0;
         const bool out = (m_periphX->getHDI08().readHDDR() & 1) != 0;
+        {   // VOC-DEATH-3 (MS2K_ISRBUSY=1): per-sample job length, PB5 rise (P:$3B4) to fall (P:$454), DSP cycles,
+            // block-granular timestamps; histogram of 128-cycle buckets printed once per 48000 jobs
+            static const bool jobLen = [] { const char* e = std::getenv("MS2K_ISRBUSY"); return e && *e == '1'; }();
+            static bool was = false; static uint64_t c0 = 0, n = 0, sum = 0, mx = 0, over = 0; static uint32_t h[24] = {};
+            const bool now = (v & 0x20) != 0;
+            if (jobLen && now != was) {
+                if (now) c0 = m_dsp->getCycles();
+                else { const uint64_t d = m_dsp->getCycles() - c0;
+                    static bool ringDumped = false;   // MS2K_DSPRING=1: the exec() ring at the first job > 3000 cycles after 3 s
+                    if (d > 3000 && g_dspRingOn && !ringDumped && m_mcuCyclesRun > 30000000ull) { ringDumped = true;
+                        printf("[JOBLEN] long job %llu cycles, start cycle %llu; IRQB injected at (rel.):", (unsigned long long)d, (unsigned long long)c0);
+                        for (unsigned k = 0; k < 8; ++k) printf(" %lld", (long long)(g_edgeCyc[(g_edgeI + k) & 7] - c0));
+                        printf(" - exec ring:\n"); dumpDspRing(); }
+                    ++n; sum += d; if (d > mx) mx = d; if (d > 2083) ++over; ++h[d / 128 < 23 ? d / 128 : 23];
+                    if (n == 48000) { printf("[JOBLEN] t=%.2f avg %llu max %llu cycles, >2083: %llu |", double(m_mcuCyclesRun) / 10e6,
+                                             (unsigned long long)(sum / n), (unsigned long long)mx, (unsigned long long)over);
+                        for (int i = 8; i < 24; ++i) printf(" %u", h[i]); printf("\n");
+                        n = sum = mx = over = 0; for (auto& x : h) x = 0; } }
+                was = now;
+            }
+        }
         static const bool irqdOff = [] { const char* e = std::getenv("MS2K_IRQD"); return e && std::strcmp(e, "off") == 0; }();
         if (out && m_pb0High && !pb0 && !irqdOff) {
             ++m_irqdEdges;
@@ -481,6 +505,32 @@ bool DSP56362Emulator::initialize(uint32_t clockHz, uint32_t /*sampleRate*/)
     if (const char* e = std::getenv("MS2K_DSPDOITER"); e && *e) {
         cfg.maxDoIterations = uint32_t(std::strtoul(e, nullptr, 0));
         printf("[DSP56362] MS2K_DSPDOITER: maxDoIterations=%u\n", cfg.maxDoIterations);
+    }
+    // VOC-DEATH-3 (2026-10-15): NO DIRECT BLOCK-TO-BLOCK LINKS. A linked chain runs without returning to the
+    // dispatcher, and the dispatcher is where pending interrupts are taken - so Korg's idle main loop
+    // (P:$12E -> $248 -> ... -> $159 -> $12E, all linked) held a pending IRQB for 369 DSP cycles every time
+    // (MS2K_IRQBLAT, measured: inject->taken 369 in the main loop; 45-62 unlinked). On the DSP56300 the
+    // interrupt words enter the fetch stream right behind the next two normal words (FM rev.5 2.3.2.7-8,
+    // Table 2-7, RENDERED p.41 = printed 2-13): a few instruction cycles, not hundreds. The late start pushed
+    // the ~1800-cycle per-sample job over the 2083-cycle fs period (MS2K_ISRBUSY: 24 % of jobs > 2083, doubled
+    // by the next IRQB nesting into the job's tail after ANDI #$FC,MR), the main loop starved, the program-ID
+    // reply (D01064 -> 7D02C7) missed the H8's window and the H8 reset + reloaded the DSP: the sound death.
+    // Unlinked: 0 resets / 0 late replies in the 30 s H09-H15 walk, but ~6 % more CPU (Tamas, GUI). Forward-only
+    // links were not enough (2 resets: the idle path is a long FORWARD chain). VOC-DEATH-3b: links stay, and every
+    // linked exit returns to the dispatcher while an interrupt request waits (JitConfig::linkCheckInterrupts,
+    // DSP::m_jitIrqCheck) - one compare per link. MS2K_DSPLINK=all = old (links, no check), =off = no links (A/B).
+    // v0.9.8 decision (measured, 30 s walk + 22 s benches, one process per run): links + check, done right (the
+    // flag cleared only by the dispatcher), cost the same as no links (8.00/8.18 s vs 8.15 s at 20.5 s; old links
+    // 7.62-7.65 s) - so the release uses the library's plain linkJitBlocks = false; the check stays as
+    // MS2K_DSPLINK=check for later optimisation work. (A faster variant that also cleared the flag when the last
+    // request was taken measured 7.85 s but let 2-7 % of the jobs run past the fs period again: rejected.)
+    cfg.linkJitBlocks = false;
+    cfg.linkCheckInterrupts = false;
+    if (const char* e = std::getenv("MS2K_DSPLINK"); e && *e) {
+        if (std::strcmp(e, "all") == 0 || *e == '1') { cfg.linkJitBlocks = true; printf("[DSP56362] MS2K_DSPLINK=all: JIT links without interrupt check (pre VOC-DEATH-3 A/B)\n"); }
+        else if (std::strcmp(e, "check") == 0) { cfg.linkJitBlocks = true; cfg.linkCheckInterrupts = true; printf("[DSP56362] MS2K_DSPLINK=check: JIT links + interrupt check (A/B)\n"); }
+        else if (std::strcmp(e, "off") == 0) { cfg.linkJitBlocks = false; printf("[DSP56362] MS2K_DSPLINK=off: no JIT links (A/B)\n"); }
+        else if (std::strcmp(e, "fwd") == 0) { cfg.linkJitBlocks = true; cfg.linkBackwardJitBlocks = false; printf("[DSP56362] MS2K_DSPLINK=fwd: forward links only (A/B)\n"); }
     }
     if (const char* e = std::getenv("MS2K_DSPBLOCK"); e && *e) {
         cfg.maxInstructionsPerBlock = uint32_t(std::strtoul(e, nullptr, 0));
@@ -529,7 +579,20 @@ void DSP56362Emulator::irqbEdge()
     const TWord iprc = m_periphX->read(0xFFFFFF, Nop);
     const bool enabled = (iprc & 0x18) != 0, edge = (iprc & 0x20) != 0;
     if (enabled && edge) {
+        // VOC-DEATH-3 diagnostic (MS2K_ISRBUSY=1): at this fs edge, is the previous per-sample job still running
+        // (Korg's own busy flag: P:$3B4 BSET #5,X:$FFFFC9 ... P:$454 BCLR) or still pending - 10 ms buckets.
+        static const bool isrBusy = [] { const char* e = std::getenv("MS2K_ISRBUSY"); return e && *e == '1'; }();
+        if (isrBusy) {
+            static uint64_t edges = 0, busy = 0, pend = 0, bucket = 0; static unsigned lines = 0;
+            ++edges; if (m_periphX->read(0xFFFFC9, Nop) & 0x20) ++busy; if (m_dsp->hasPendingInterrupt(Vba_IRQB)) ++pend;
+            const uint64_t b = m_mcuCyclesRun / 100000;   // 10 ms
+            if (b != bucket) { if ((busy || pend) && lines < 3000) { ++lines;
+                    printf("[ISRBUSY] t=%.2f edges %llu, job still running at %llu, still pending at %llu\n", double(bucket) / 100.0,
+                           (unsigned long long)edges, (unsigned long long)busy, (unsigned long long)pend); }
+                bucket = b; edges = busy = pend = 0; }
+        }
         if (!m_dsp->hasPendingInterrupt(Vba_IRQB)) m_dsp->injectInterrupt(Vba_IRQB);
+        g_edgeCyc[g_edgeI++ & 7] = m_dsp->getCycles();   // VOC-DEATH-3: DSP cycle of the last 8 IRQB injections
         ++m_irqbEdges;
         // ISSUE3 (MS2K_FSPHASELOG=1, diagnostic): where in the ESAI frame the IRQB edge lands, in DSP cycles
         // after the last TX frame callback (frame period ~2083 cycles at 99.98 MHz), 64-cycle buckets.
@@ -811,6 +874,12 @@ void DSP56362Emulator::runForMcuCycles(uint32_t mcuCycles, uint32_t mcuHz)
         // once per MCU second: how far the DSP got
         if (m_mcuCyclesRun >= m_nextSummary) {
             m_nextSummary = m_mcuCyclesRun + mcuHz;
+        // VOC-DEATH-3 diagnostic (MS2K_INTCOUNT=1): interrupts taken per vector in the last MCU second.
+        static const bool intCount = [] { const char* e = std::getenv("MS2K_INTCOUNT"); return e && *e == '1'; }();
+        if (intCount) { static uint64_t last[256] = {}; std::string s; char b[32];
+            for (int v = 0; v < 256; ++v) { const uint64_t d = m_dsp->m_intTaken[v] - last[v]; last[v] = m_dsp->m_intTaken[v];
+                if (d) { std::snprintf(b, sizeof b, " $%02X:%llu", v, (unsigned long long)d); s += b; } }
+            printf("[INTCOUNT] t=%.2f%s\n", double(m_mcuCyclesRun) / double(mcuHz), s.c_str()); }
             static unsigned told = 0;
             static const auto wall0 = std::chrono::steady_clock::now();   // first summary = wall 0
             // first minute every second; later every 30 s, and in any second that lost SHI words (VOCODER-1 follow-up)
@@ -822,15 +891,19 @@ void DSP56362Emulator::runForMcuCycles(uint32_t mcuCycles, uint32_t mcuHz)
               if (!smTold && (m_dsp->getSR().toWord() & 0x100000)) { smTold = true;
                   printf("[DSP56362] WARNING: SR.SM (arithmetic saturation) is set at PC=%06X - the JIT does not model it\n", m_dsp->getPC().toWord()); } }
             if (told < 60 || ovrNew || secs % 30 == 0) { ++told;
-                printf("[DSP56362] t=%.2f s: PC=%06X SR=%06X core=%llu Hz instr=%llu cycles=%llu TX frames=%llu "
-                       "IRQB edges=%llu IRQD(PB0) edges=%llu (%.3f s in DMA) exec()=%llu SHI words in=%llu (RX overruns %llu) wall=%.2f s sync calls %llu runs %llu fs runs %llu\n",
+                fprintf(stderr, "[DSP56362] t=%.2f s: PC=%06X SR=%06X core=%llu Hz instr=%llu cycles=%llu TX frames=%llu "
+                       "IRQB edges=%llu IRQD(PB0) edges=%llu (%.3f s in DMA) exec()=%llu SHI words in=%llu (RX overruns %llu) wall=%.2f s sync calls %llu runs %llu fs runs %llu "
+                       "JIT chains=%u blocks=%llu codeMB=%.2f recreates=%llu\n",
                        double(m_mcuCyclesRun) / double(mcuHz), m_dsp->getPC().toWord(), m_dsp->getSR().toWord(),
                        (unsigned long long)coreHz(),
                        (unsigned long long)m_dsp->getInstructionCounter(),
                        (unsigned long long)m_dsp->getCycles(), (unsigned long long)m_txFrames,
                        (unsigned long long)m_irqbEdges, (unsigned long long)m_irqdEdges, double(m_irqdNs) * 1e-9, (unsigned long long)m_execCalls, (unsigned long long)m_wordsIn, (unsigned long long)m_shiOverruns,
                        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count(),
-                       (unsigned long long)m_syncCalls, (unsigned long long)m_syncRuns, (unsigned long long)m_fsRuns); }
+                       (unsigned long long)m_syncCalls, (unsigned long long)m_syncRuns, (unsigned long long)m_fsRuns,
+                       (unsigned)m_dsp->getJit().getChainCount(), (unsigned long long)m_dsp->getJit().getCurrentBlockCount(),
+                       double(m_dsp->getJit().getCurrentCodeSize()) / 1048576.0,
+                       (unsigned long long)m_dsp->getJit().getRecreateCount()); }
         }
     }
     // ESAI output rate, measured against MCU time: the first frame, then every 48000.
@@ -994,6 +1067,7 @@ void DSP56362Emulator::traceEvents()
 void DSP56362Emulator::setSS(bool asserted)
 {
     if (asserted == m_ssWas) return;
+    if (m_d0Pending) printf("[D0LAT] SS %s at +%llu MCU\n", asserted ? "asserted" : "released", (unsigned long long)(m_mcuCyclesRun - m_d0Mcu));   // VOC-DEATH-3
     if (!asserted && m_dsp) {
         static unsigned told = 0;
         if (told < 32) { ++told;
@@ -1046,7 +1120,30 @@ uint8_t DSP56362Emulator::spiByte(uint8_t mosi, bool ssAsserted)
     const uint32_t bytesPerWord = hm == 0 ? 1 : hm == 1 ? 2 : 3;
 
     ++m_frameBytes;
-    if (m_byteIdx == 0) { m_outWord = shi.peekTx(); m_outFresh = shi.hasTxData(); }   // what the shift register will send
+    if (m_byteIdx == 0) { m_outWord = shi.peekTx(); m_outFresh = shi.hasTxData();    // what the shift register will send
+        // VOC-DEATH-3 diagnostic (MS2K_D0LAT=1): the reply window of a D01064 program-ID query, in DSP cycles from
+        // the query word's arrival: when the DSP read it (HRX), wrote HTX, and when the reply word is latched here.
+        static const bool d0lat = [] { const char* e = std::getenv("MS2K_D0LAT"); return e && *e == '1'; }();
+        // MS2K_D0FAIL=<MCU s> (FAULT INJECTION, measurement only): the first program-ID reply after that time is
+        // withheld (stale 000000), so the H8 takes its own DSP reset + reload path - to test that path alone.
+        static double d0fail = [] { const char* e = std::getenv("MS2K_D0FAIL"); return e ? std::atof(e) : -1.0; }();
+        if (d0fail >= 0 && m_d0Pending && double(m_mcuCyclesRun) / 10e6 >= d0fail) {
+            d0fail = -1.0; m_outWord = 0; m_outFresh = false;
+            printf("[D0FAIL] injected: program-ID reply withheld at MCU t=%.6f\n", double(m_mcuCyclesRun) / 10e6); }
+        // MS2K_D0FORCE=1 (FAULT INJECTION, measurement only): a stale program-ID reply is replaced by the
+        // expected 7D02C7, so the H8 never takes its reset path - A/B for "is the reset the trigger".
+        static const bool d0force = [] { const char* e = std::getenv("MS2K_D0FORCE"); return e && *e == '1'; }();
+        if (d0force && m_d0Pending && !m_outFresh) { m_outWord = 0x7D02C7; m_outFresh = true;
+            printf("[D0FORCE] stale program-ID reply replaced at MCU t=%.6f\n", double(m_mcuCyclesRun) / 10e6); }
+        if (!d0lat) m_d0Pending = false;
+        if (d0lat && m_d0Pending) { m_d0Pending = false;
+            const uint64_t now = m_dsp->getCycles(), rd = shi.hrxReadCycle(), wr = shi.htxWriteCycle();
+            printf("[D0LAT] t=%.6f latch +%llu MCU +%llu DSPcyc, HRX read %s%lld, HTX write %s%lld, reply %06X %s PC=%06X\n",
+                   double(m_mcuCyclesRun) / 10e6, (unsigned long long)(m_mcuCyclesRun - m_d0Mcu), (unsigned long long)(now - m_d0Cycle),
+                   rd >= m_d0Cycle ? "+" : "(before) ", (long long)(rd - m_d0Cycle),
+                   wr >= m_d0Cycle ? "+" : "(before) ", (long long)(wr - m_d0Cycle),
+                   m_outWord, m_outFresh ? "fresh" : "STALE", m_dsp->getPC().toWord()); }
+    }
     const uint32_t shift = 8 * (bytesPerWord - 1 - m_byteIdx);
     const uint8_t  miso  = uint8_t(m_outWord >> shift);
     m_inWord = (m_inWord << 8) | mosi;
@@ -1066,6 +1163,7 @@ uint8_t DSP56362Emulator::spiByte(uint8_t mosi, bool ssAsserted)
         if (m_frameWordsN < 64) { m_frameIn[m_frameWordsN] = m_inWord;
                                  m_frameOut[m_frameWordsN] = m_outWord | (m_outFresh ? 0 : 0x80000000u); ++m_frameWordsN; }
         ++m_wordsIn;
+        if ((m_inWord & 0xFFFFFF) == 0xD01064) { m_d0Pending = true; m_d0Cycle = m_dsp->getCycles(); m_d0Mcu = m_mcuCyclesRun; }   // VOC-DEATH-3
         m_byteIdx = 0; m_inWord = 0;
     }
     return miso;
@@ -1079,6 +1177,21 @@ bool DSP56362Emulator::hreqAsserted() const
     if (!(hcsr & 1) || hrqe == 0) return false;      // HREQ tri-stated
     if (hrqe == 1) return ((hcsr >> 19) & 1) == 0;   // receive: asserted while the FIFO is not full
     return false;                                    // HRQE 10/11: not modelled yet (not used by the ROM)
+}
+
+// 2026-10-13 EMU RX-FLOW GATE (see the header for the full rationale and measurements).
+bool DSP56362Emulator::shiRxFull() const
+{
+    if (!m_dsp) return false;
+    const TWord hcsr = m_periphX->getSHI().read(SHI::HCSR);
+    return (hcsr & 1) && (((hcsr >> 7) & 3) == 1) && (((hcsr >> 19) & 1) != 0);
+}
+
+void DSP56362Emulator::runForMcuCyclesDrain(uint32_t mcuCycles)
+{
+    flushPend();                                  // the MCU's own time so far first, in order
+    post(mcuCycles, m_pendHz);                    // then the extra drain cycles through the queue
+    if (m_thr.joinable()) drain();                 // and wait where the MCU looks at the DSP
 }
 
 } // namespace MS2000

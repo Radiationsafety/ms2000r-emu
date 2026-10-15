@@ -1,0 +1,79 @@
+From 72028d6fe7ad2279057628bcfcf4f6672a0bffa5 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Thu, 15 Oct 2026 03:04:48 +0200
+Subject: [PATCH 23/24] VOC-DEATH-3 FIX: unlinked JIT blocks - pending
+ interrupts are taken at every block, not after a linked chain
+
+Root cause of the H09-H15 vocoder-switching sound death. With linkJitBlocks the JIT runs a chain of
+linked blocks without returning to the dispatcher, where pending interrupts are taken. Korg's idle main
+loop (P:$12E -> $248 -> ... -> $159 -> $12E) is such a chain: a pending IRQB (the per-sample job) was
+taken 369 DSP cycles late, every time (MS2K_IRQBLAT). FM rev.5 2.3.2.7-8, Table 2-7 (RENDERED p.41 =
+printed 2-13): the interrupt words enter the fetch stream right behind the next two normal words.
+
+Chain of effects, each measured:
+- the ~1800-cycle job started ~369 cycles late, so it ended after the next fs edge; that IRQB nested
+  into the job's tail after ANDI #$FC,MR (exec ring: job 0..1796, next job at 1802) - 24 % of jobs
+  > 2083 cycles (MS2K_ISRBUSY / [JOBLEN]), back to back, the main loop starved
+- the H8's program-ID check (0x013B68-74: D01064 -> expects 7D02C7) got no reply in its ~4500-cycle
+  window, so the firmware reset and reloaded the DSP (0x0106F4); repeated resets left TX at zero
+- block-size A/B: max 1-4 instructions per block (no long chains) = 0 resets, 8/16/64 = resets;
+  MS2K_DSPDOITER=1 does not help; MS2K_DSPSPEED 1.05 hid it (more cycles for the same late start)
+
+Fix: cfg.linkJitBlocks = false (MS2K_DSPLINK=1 = old behaviour, A/B). IRQB latency 45-62 cycles.
+
+Measured (HostTest 48k/512, 700 ms H09..H16 ping-pong walk with held notes, 30 s, KNOBSKEEP):
+- fixed:  0 resets, 0 late replies, every job < 2083 (max 1987, avg ~1810), sound at 21 s 0.0026,
+          26-27 s 0.0033/0.0046
+- old (MS2K_DSPLINK=1): 4 resets, 4 late replies, TX exact zero 15-27 s
+- slow sequence H13 -> H08 (2 s steps, 22 s): 0 resets, H08 sounds 12-20 s (0.0025-0.0066)
+- speed: 20.5 s of MCU time in 8.15 s wall vs 7.71 s (~6 % slower)
+- nvram hash C3044548B968580A unchanged
+
+Diagnostics added (default off): MS2K_IRQBLAT=<n> (IRQB inject/taken cycles, dsp56300),
+[JOBLEN] with MS2K_ISRBUSY=1 (job length histogram, exec ring at the first job > 3000 with
+MS2K_DSPRING=1), MS2K_PCCYC=<pc>[:n] (H8 cycles per visit; the SS-release delay loop at
+0x010C04 measured 8 states/iteration = HM), MS2K_DSPLINK.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hob75q4ASH4mPmALoirbn6
+---
+ source/dsp56kEmu/dsp.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 7553587d..2f0e9b30 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -214,6 +214,10 @@ namespace dsp56k
+ 		pcCurrentInstruction = vba;
+ 		m_processingMode = FastInterrupt;
+ 		if(vba < 256) ++m_intTaken[vba];	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector
++		{	static const int s_latN = [] { const char* e = std::getenv("MS2K_IRQBLAT"); return e ? std::atoi(e) : 0; }();
++			static int s_seen = 0;
++			if(s_latN && vba == 0x12 && m_cycles > 300000000ull && s_seen < s_latN) { ++s_seen;
++				printf("[IRQBLAT] taken  c=%llu SR=%06X\n", (unsigned long long)m_cycles, reg.sr.var); } }
+ 
+ #if DSP56300_DEBUGGER
+ 		if(m_debugger)
+@@ -1437,6 +1441,18 @@ namespace dsp56k
+ 
+ 		m_pendingInterrupts.push_back({_interruptVectorAddress});
+ 
++		// MS2000 VOC-DEATH-3 diagnostic (MS2K_IRQBLAT=<n>, after 3e8 cycles): the state an IRQB request meets
++		static const int s_latN = [] { const char* e = std::getenv("MS2K_IRQBLAT"); return e ? std::atoi(e) : 0; }();
++		static int s_latSeen = 0;
++		if(s_latN && _interruptVectorAddress == 0x12 && m_cycles > 300000000ull && s_latSeen < s_latN)
++		{
++			++s_latSeen;
++			const int kind = m_interruptFunc == m_execPeripheralsFunc ? 0 : m_interruptFunc == &dspExecInterrupts ? 1
++						   : m_interruptFunc == &dspExecDefaultPreventInterrupt ? 2 : m_interruptFunc == &dspExecNop ? 3 : 4;
++			printf("[IRQBLAT] inject c=%llu PC=%06X SR=%06X mode=%d func=%d pending=%u\n", (unsigned long long)m_cycles,
++				   pcCurrentInstruction, reg.sr.var, int(m_processingMode), kind, unsigned(m_pendingInterrupts.size()));
++		}
++
+ 		if(m_interruptFunc == m_execPeripheralsFunc)
+ 			m_interruptFunc = &dspExecInterrupts;
+ 
+-- 
+2.49.0.windows.1
+

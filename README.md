@@ -1,4 +1,4 @@
-# ms2000r-emu  (v0.9.7)
+# ms2000r-emu  (v0.9.8)
 
 A hardware-level emulator of the **KORG MS2000R** (rack version of the MS2000 analog-modeling synthesizer):
 the H8S/2350 main CPU runs the original firmware instruction by instruction, and the DSP56362 runs the
@@ -68,8 +68,11 @@ machine's memory and `recordings\` are kept there.
 | file (in the working folder) | what | required |
 |---|---|---|
 | `flash.bin` | the MS2000R main flash (1 MB, MBM29LV800BA) | yes |
-| `full FW/boot-362.bin` | the DSP56362 boot ROM (768 bytes = 192 words x 4, little endian); the widely shared dump works - its two known bad words are corrected in memory. A corrected `boot-362.ms2000.bin` is used first if present | yes (no sound without it) |
-| `hd44780_a00.bin` | the LCD controller's character generator ROM (4096 bytes) | no (the LCD falls back to text) |
+| `boot-362.bin` | the DSP56362 boot ROM (768 bytes = 192 words x 4, little endian), **beside `flash.bin` or in its `full FW` subfolder** (both work since v0.9.8); the widely shared dump works - its two known bad words are corrected in memory. A corrected `boot-362.ms2000.bin` is used first if present | yes (no sound without it) |
+| `hd44780_a00.bin` | the LCD controller's character generator ROM (4096 bytes), beside `flash.bin` or in `full FW` | no (the LCD falls back to text) |
+
+If something is missing, the console / the plugin's panel names the missing file and the folder it looked in.
+The release zip has a `ROMS - READ ME.txt` with the same instructions.
 
 The emulator never writes `flash.bin`: what the firmware writes (WRITE) goes to `ms2000_flash_state.bin` /
 `.sectors` beside it (standalone) or into the host project (plugin).

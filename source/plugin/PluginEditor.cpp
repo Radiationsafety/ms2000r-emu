@@ -131,7 +131,7 @@ Ms2kEditor::Ms2kEditor(Ms2kProcessor& p) : AudioProcessorEditor(p), m_proc(p)
     // HD44780 A00 character generator, if the local dump is present (thin_gui's loadCgRom: 16 bytes a
     // character, rows 0-7, 5 low bits). Without it the LCD is drawn as text. The working directory is the
     // MS2000 folder (the processor set it).
-    for (const char* f : { "hd44780_a00.bin" }) {
+    for (const char* f : { "hd44780_a00.bin", "full FW/hd44780_a00.bin" }) {   // ROM-PATHS-1
         juce::MemoryBlock mb;
         if (juce::File::getCurrentWorkingDirectory().getChildFile(f).loadFileAsData(mb) && mb.getSize() >= 4096) {
             const auto* b = static_cast<const uint8_t*>(mb.getData());
@@ -213,7 +213,7 @@ Ms2kEditor::Ms2kEditor(Ms2kProcessor& p) : AudioProcessorEditor(p), m_proc(p)
         });
     };
     m_homeBtn.onClick = [this] {
-        m_chooser = std::make_unique<juce::FileChooser>("The folder with flash.bin and full FW\\boot-362.bin", juce::File(m_proc.homePath()));
+        m_chooser = std::make_unique<juce::FileChooser>("The folder with flash.bin and boot-362.bin (beside it or in 'full FW')", juce::File(m_proc.homePath()));
         m_chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
             const auto d = fc.getResult();
             if (d.isDirectory()) { m_proc.chooseHome(d); m_dirty = true; }
@@ -508,7 +508,7 @@ void Ms2kEditor::paint(juce::Graphics& g)
         const auto box = pa.withSizeKeepingCentre(pa.getWidth() * 0.62f, pa.getHeight() * 0.22f);
         g.setColour(juce::Colour(20, 22, 26).withAlpha(0.92f)); g.fillRoundedRectangle(box, 8.0f);
         g.setColour(juce::Colour(236, 242, 244)); g.setFont(juce::Font(juce::jmax(13.0f, pa.getHeight() * 0.024f)));
-        g.drawFittedText(m_proc.status() + "\n\nSettings -> \"Choose the MS2000 folder...\" (the folder with flash.bin and full FW\\boot-362.bin).",
+        g.drawFittedText(m_proc.status() + "\n\nSettings -> \"Choose the MS2000 folder...\" (the folder with flash.bin; boot-362.bin beside it or in its 'full FW' subfolder; hd44780_a00.bin optional).",
                          box.reduced(18.0f).toNearestInt(), juce::Justification::centred, 6);
     }
     m_paintMs = juce::Time::getMillisecondCounterHiRes() - t0;

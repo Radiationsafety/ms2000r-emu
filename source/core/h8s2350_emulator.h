@@ -1718,6 +1718,9 @@ private:
     // Mirrors the SCI1 pair that BUG43 built (m_sci1_tx_active / m_sci1_tx_busy_cycles).
     bool     m_sci0_tx_active      = false;
     uint64_t m_sci0_tx_busy_cycles = 0;
+    // 2026-10-13 EMU RX-FLOW GATE (see dsp56362_emulator.h): re-arm count for the current
+    // character while the DSP's SHI RX FIFO is full; reset when the byte finally lands.
+    int      m_sci0_gate_rearms   = 0;
     bool     m_sci0_timing_told    = false;   // print the character time once
 
     // === BUG78: THE A/D CONVERTER, H'FF90-H'FF99 ===

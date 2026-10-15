@@ -65,7 +65,17 @@ void play(juce::AudioPluginInstance& inst, juce::AudioBuffer<float>& out, int fr
         if (noteOn >= pos && noteOn < pos + n) midi.addEvent(juce::MidiMessage::noteOn(1, g_note, (juce::uint8)100), noteOn - pos);
         if (noteOff >= pos && noteOff < pos + n) midi.addEvent(juce::MidiMessage::noteOff(1, g_note), noteOff - pos);
         if (g_echo) { for (const auto m : g_echoBuf) midi.addEvent(m.getMessage(), 0); g_echoBuf.clear(); }
-        for (const auto& e : g_smf) if (e.first >= pos && e.first < pos + n) midi.addEvent(e.second, e.first - pos);
+        for (const auto& e : g_smf) if (e.first >= pos && e.first < pos + n) {
+            midi.addEvent(e.second, e.first - pos);
+            {   // 2026-10-14 SMF-INJECT instrument (capped): only 12 of 3044 events ever reached the
+                // plugin's collection, and those only at t=25.7 - bracket where the rest vanish.
+                static unsigned inj = 0;
+                if (inj < 10) { ++inj;
+                    std::printf("[SMF-INJECT] ev.abs=%d off=%d host.pos=%d n=%d (inject %u)\n",
+                                e.first, e.first - pos, pos, n, inj);
+                }
+            }
+        }
         if (g_head) g_head->pos = pos;
         const double t0 = juce::Time::getMillisecondCounterHiRes();
         inst.processBlock(buf, midi);
@@ -168,7 +178,8 @@ int main(int argc, char** argv)
         }
         juce::ValueTree t("MS2000R");
         juce::String z; for (int i = 0; i < 32; ++i) z << (i ? ",0" : "0");
-        t.setProperty("v", 1, nullptr); t.setProperty("knobs", z, nullptr);
+        t.setProperty("v", 1, nullptr);
+        if (!std::getenv("MS2K_KNOBSKEEP")) t.setProperty("knobs", z, nullptr);   // VOC-DEATH-1: MS2K_KNOBSKEEP=1 = the folder's flash, pots as the plugin starts them
         t.setProperty("flashMask", mask, nullptr); t.setProperty("flash", raw.getMemoryBlock(), nullptr);
         setState(*inst, t);
         std::cout << "first instance, knobs all 0, " << flashOf(t) << "\n";
@@ -185,7 +196,11 @@ int main(int argc, char** argv)
         std::cout << "knobs all 0, " << flashOf(t) << "\n";
     }
 
-    if (mode == "smf") {   // DEMO-FMT-1: MS2K_SMF=<file.mid> played into MIDI IN from MS2K_SMFAT seconds (default 3), no test note.
+    if (mode == "smf" || std::getenv("MS2K_SMF")) {   // DEMO-FMT-1: MS2K_SMF=<file.mid> played into MIDI IN from MS2K_SMFAT
+        // seconds (default 3). 2026-10-14: env-driven, so knobs0s (the flash-state + knobs-at-0 boot) can also
+        // play a .mid - the H-bank note audit needs BOTH: the saved machine state AND real notes through the
+        // program switches (measured: with mode=knobs0s the SMF never loaded and every run was note-silent
+        // after the built-in t=4..7 test note).
         // As the firmware's demo player does (0x22952, read from the disassembly; checked byte for byte with
         // MS2K_REGWATCH=2566): every event in FILE order (equal ticks keep their order - juce::MidiFile does not),
         // running status, F0 SysEx, FF 51 tempo; and a MIDI clock F8 every division/24 ticks from the start.
@@ -224,7 +239,8 @@ int main(int argc, char** argv)
     juce::AudioBuffer<float> out(2, juce::jmax(1, total));
     out.clear();
     int midiOutEvents = 0, noteOn = int(4.0 * rate), noteOff = int(7.0 * rate);
-    if (mode == "smf" || std::getenv("MS2K_DEMOAT")) noteOn = noteOff = -1;   // DEMO-FMT-1: no test note
+    // DEMO-FMT-1: no test note when the SMF (or the demo) supplies the notes. 2026-10-14: MS2K_SMF counts too.
+    if (mode == "smf" || std::getenv("MS2K_DEMOAT") || std::getenv("MS2K_SMF")) noteOn = noteOff = -1;
     const auto t0 = juce::Time::getMillisecondCounterHiRes();
     if (mode == "reboot") {
         inst->prepareToPlay(rate, block);
