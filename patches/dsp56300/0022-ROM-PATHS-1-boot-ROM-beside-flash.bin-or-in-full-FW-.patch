@@ -1,0 +1,63 @@
+From c8169d3d13ef66464fff1cde5cc61e2f63b388c2 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Thu, 15 Oct 2026 02:25:37 +0200
+Subject: [PATCH 22/24] ROM-PATHS-1: boot ROM beside flash.bin or in "full FW";
+ clear missing-ROM messages; INTCOUNT diagnostic
+
+Users put boot-362.bin beside flash.bin (audio forum, v0.9.7) and got no sound / no start: the folder was
+only valid with full FW\boot-362*.bin. One finder now (source/core/rom_paths.h) used by the DSP loader,
+the standalone home search and the plugin's validHome:
+- boot ROM order: full FW/boot-362.ms2000.bin, boot-362.ms2000.bin (root), full FW/boot-362.bin,
+  boot-362.bin (root); "Full FW" also listed for case-sensitive file systems; BOOTROM-1 two-word
+  correction applies to whichever public dump is found
+- hd44780_a00.bin also found in full FW (standalone LCD, thin GUI, plugin editor)
+- plugin status / chooser texts and the standalone [HOME] line name what is missing and where
+- packaging/ROMS - READ ME.txt for the release zip
+
+Measured (HostTest 48k/512, 6 s, note 3-5 s, fresh folders with a copy of flash.bin, deleted after):
+- boot-362.bin in the root: DSP BUILT, "boot-362.bin with words $17/$2D corrected", RMS 3 s 0.0605
+- boot-362.bin in "Full FW": same, RMS identical (0.0605 / 0.0487)
+- no boot ROM: folder rejected, the plugin falls back to the next candidate (F:\MS2000), as designed
+- standalone (ms2000_emulator --headless) started in the root-layout folder: DSP BUILT from boot-362.bin
+- nvram hash C3044548B968580A unchanged
+
+Also: MS2K_INTCOUNT=1 (VOC-DEATH-3, default off) prints interrupts taken per vector each MCU second
+(dsp56300 DSP::m_intTaken). Measured 700 ms walk: per sample $12 (IRQB job) 1, $30/$32 (ESAI RX) 1+1,
+$38/$3A (ESAI TX) 1+1, $22 (DMA1 -> P:$3A8 -> P:$500) 2 - no duplicated interrupt source found.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hob75q4ASH4mPmALoirbn6
+---
+ source/dsp56kEmu/dsp.cpp | 1 +
+ source/dsp56kEmu/dsp.h   | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 3f1b3ab0..7553587d 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -213,6 +213,7 @@ namespace dsp56k
+ 	{
+ 		pcCurrentInstruction = vba;
+ 		m_processingMode = FastInterrupt;
++		if(vba < 256) ++m_intTaken[vba];	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector
+ 
+ #if DSP56300_DEBUGGER
+ 		if(m_debugger)
+diff --git a/source/dsp56kEmu/dsp.h b/source/dsp56kEmu/dsp.h
+index 1a3ed88d..49b65648 100644
+--- a/source/dsp56kEmu/dsp.h
++++ b/source/dsp56kEmu/dsp.h
+@@ -156,6 +156,9 @@ namespace dsp56k
+ 
+ 	private:
+ 		void execInterruptsByPriority();
++	public:
++		uint64_t m_intTaken[256] = {};	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector address
++	private:
+ 		void onLongInterruptFormed(TWord _vba);
+ 
+ 		TInterruptPriorityFunc						m_interruptPriorityFunc;
+-- 
+2.49.0.windows.1
+

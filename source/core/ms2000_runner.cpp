@@ -20,6 +20,7 @@
 #include <thread>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <sstream>
 // fw20.txt: Async log rate limiting
 #include "async_log.h"
@@ -1130,6 +1131,14 @@ void Ms2kRunner::sendMIDIData(const uint8_t* data, size_t length) {
     // BUG108: host MIDI IN goes onto SCI1's receive line (RXD1 = MIDI IN, KOD-A30411). It used to
     // end in MS2000MIDIInterfaceSimple's queue, which nothing the firmware reads ever drained.
     if (m_cpu) m_cpu->midiInPush(data, length);
+    {   // 2026-10-14 MIDI-PUSH instrument (capped): the [MIDI-IN] prints showed the SMF bytes only
+        // reaching the SCI1 at MCU t=25.7 s though the .mid starts at 4 s - bracket the delay.
+        static unsigned n = 0;
+        if (n < 24) { ++n;
+            std::fprintf(stderr, "[MIDI-PUSH] %zu bytes (first %02X) at push %u\n",
+                         length, length ? data[0] : 0, n);
+        }
+    }
 }
 
 // fw23.txt: Panel I/O API methods for validation framework

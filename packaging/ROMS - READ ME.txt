@@ -1,0 +1,24 @@
+MS2000R emulator - where the ROM files go
+==========================================
+
+This package contains NO firmware and NO ROM. You need dumps of your own MS2000R.
+
+Put these files into THIS folder (the one with ms2000_emulator.exe and MS2000R.bat):
+
+  flash.bin          the MS2000R main flash, 1 MB                         REQUIRED
+  boot-362.bin       the DSP56362 boot ROM, 768 bytes                     REQUIRED (no sound without it)
+                     (or boot-362.ms2000.bin - the corrected copy is used first)
+  hd44780_a00.bin    the LCD character ROM, 4096 bytes                    optional (text LCD without it)
+
+boot-362.bin and hd44780_a00.bin may also sit in the "full FW" subfolder - both places work.
+
+Then start MS2000R.bat. If something is missing, the console / log names the missing file and the folder
+it looked in.
+
+VST3: copy VST3\MS2000R.vst3 into your VST3 folder (usually C:\Program Files\Common Files\VST3). On the
+first start open Settings -> "Choose the MS2000 folder..." and pick THIS folder; it is remembered in
+%APPDATA%\MS2000R\home.txt. (Copying this whole folder into the VST3 folder also works, but is not needed.)
+
+The folder is found in this order: MS2K_HOME (environment variable), the folder chosen in Settings
+(plugin), Documents\MS2000R (plugin), the current folder (exe), then the exe's / plugin's folder and the
+folders above it.

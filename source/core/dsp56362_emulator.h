@@ -151,6 +151,19 @@ public:
 
     // HREQ is an active-low OUTPUT in slave mode (DSP56362/D Table 1-10): true = asserted.
     bool hreqAsserted() const;
+    // 2026-10-13 EMU RX-FLOW GATE: the MS2k H8S firmware never polls DSP_REQ for the SHI
+    // (measured: MS2K_P4LOG=1 shows zero PORT4 reads in a 30 s run) - the real machine never
+    // needs to, because the real DSP consumes the DMAC burst comfortably. Our DSP thread
+    // consumes in per-character syncMcu slices (24-ish cycles each), too small to complete
+    // a handler consume iteration, so the 10-word FIFO fills on the burst and the first
+    // word is dropped (measured: overrun #1 at MCU t=6.66, DSP PC=000521 - the upload
+    // handler - 3.5 ms BEFORE the wild-pc walk it causes). The gate gives the DSP extra
+    // EMULATED cycles at the character moment when the FIFO is full, so the drain rate the
+    // real silicon always had is restored in emulated time. No wall-time hacks, no data
+    // fabricated; bounded, and it only engages on the full-FIFO moments.
+    bool shiRxFull() const;
+    bool m_d0Pending = false; uint64_t m_d0Cycle = 0, m_d0Mcu = 0;   // VOC-DEATH-3 diagnostic (MS2K_D0LAT)
+    void runForMcuCyclesDrain(uint32_t mcuCycles);
 
     dsp56k::DSP* getGearmulatorDSP() const { return m_dsp.get(); }
 

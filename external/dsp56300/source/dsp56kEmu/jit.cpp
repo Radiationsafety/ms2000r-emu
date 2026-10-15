@@ -1,5 +1,22 @@
 #include "jit.h"
 
+#include <intrin.h>
+#include <thread>
+#include <functional>
+
+// 2026-10-12 recreate-pingpong hunt: minimal kernel32 declarations - including <windows.h> breaks
+// fastmath.h with macro clashes, so declare the three APIs and the two flags we need.
+#ifdef _WIN32
+extern "C"
+{
+	__declspec(dllimport) unsigned long __stdcall CaptureStackBackTrace(unsigned long _framesToSkip, unsigned long _framesToCapture, void** _backTrace, unsigned long* _backTraceHash);
+	__declspec(dllimport) void* __stdcall GetModuleHandleW(const wchar_t* _moduleName);
+	__declspec(dllimport) int __stdcall GetModuleHandleExW(unsigned long _flags, const void* _moduleName, void** _module);
+}
+#define MS2K_GMHEX_FROM_ADDRESS       4u
+#define MS2K_GMHEX_UNCHANGED_REFCOUNT 2u
+#endif
+
 #include "dsp.h"
 #include "jitblock.h"
 #include "jitdspmode.h"
@@ -85,14 +102,163 @@ namespace dsp56k
 #endif
 	constexpr bool g_traceOps = false;
 
+	// 2026-10-12 MS2000 H-bank vocoder crash hunt: true while funcCreate/funcRecreate (called from JIT'd
+	// code) is on the stack. create() checks it to NOT exec the freshly compiled block from inside its
+	// own C++ frame - the caller block's ret unwinds to the dispatch loop on a flat stack instead.
+	// The old exec-from-create nested one C++ frame per block; a first-time run of the H-bank vocoder
+	// program change reached depth 3951 and overflowed the stack, killing the host.
+	thread_local bool g_inFuncCreate = false;
+	struct SetInFuncCreate { ~SetInFuncCreate(){ g_inFuncCreate = false; } SetInFuncCreate(){ g_inFuncCreate = true; } };
+
+	// 2026-10-12 memory-appetite hunt: defined in jitblockchain.cpp
+	extern std::atomic<uint64_t> g_jitRecreateCount;
+
 	void funcCreate(JitDspPtr* _jit, const TWord _pc) noexcept
 	{
-		Jit::toJitPtr(_jit)->create(_pc, true);
+		auto* const jit = Jit::toJitPtr(_jit);
+
+		// 2026-10-12: a pc outside the JIT-covered program window must never index the block caches
+		// (measured: pc 0x800010 during the H-bank program change -> bad_alloc / 26 GB commit /
+		// std::terminate kills the host). The dispatch loop exits on the same condition; the machine
+		// visibly stops instead of taking the process down.
+		if (_pc >= jit->dsp().memory().sizeP())
+		{
+			static thread_local int s_oobCreate = 0;
+			if ((++s_oobCreate & 1023) == 1)
+				std::fprintf(stderr, "[JIT] funcCreate: pc 0x%06X outside the compiled program window (0x%X) - not compiling\n",
+					_pc, jit->dsp().memory().sizeP());
+			return;
+		}
+
+		const SetInFuncCreate guard;
+		try
+		{
+			Jit::toJitPtr(_jit)->create(_pc, true);
+		}
+		catch (const std::exception& e)
+		{
+			// 2026-10-12: an exception escaping this noexcept function is std::terminate (measured at the
+			// H08 program change). Name it on stderr - stderr is unbuffered, it survives the abort.
+			std::fprintf(stderr, "[JIT-EXC] funcCreate std::exception at pc 0x%06X: %s\n", _pc, e.what());
+			throw;
+		}
+		catch (...)
+		{
+			std::fprintf(stderr, "[JIT-EXC] funcCreate unknown exception at pc 0x%06X\n", _pc);
+			throw;
+		}
+	}
+
+	// 2026-10-12 recreate-pingpong hunt: called by the generated execUntilCycles dispatch INSTEAD of a
+	// direct funcRecreate call, with the exact function pointer the ASM loaded from the entries table.
+	// Prints the loaded value against the slot's value at the same instant - if they differ, a second
+	// thread rewrote the slot between the ASM load and the call (the H8S upload path); if the loaded
+	// value is not funcRecreate at all, the call target came from somewhere else entirely.
+	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;	// defined below
+	void funcRecreateTrace(JitDspPtr* _jit, const TWord _pc, const void* _loaded) noexcept
+	{
+		auto* const jit = Jit::toJitPtr(_jit);
+		{
+			static thread_local int s_p = 0;
+			extern volatile uint64_t g_dbgAsmBase;
+			extern volatile uint64_t g_dbgAsmIndex;
+			if (s_p < 60)
+			{
+				++s_p;
+				const auto slot = jit->dsp().getJitEntries()[_pc];
+				const auto memberBase = jit->dsp().getJitEntries();
+				const auto asmB = g_dbgAsmBase;			// single reads - volatiles are raced by the other thread's iterations
+				const auto asmI = g_dbgAsmIndex;
+				const void* directCell = *reinterpret_cast<void* const*>(static_cast<uintptr_t>(asmB + asmI * 8));
+				std::fprintf(stderr, "[TR] pc=0x%06X loaded=%p slotNow=%p matchLoad=%d asmBase=%p asmIdx=0x%llX cell=%p ccBase=%p dspNow=%p directCell=%p\n",
+					_pc, _loaded,
+					*reinterpret_cast<void* const*>(&slot),
+					_loaded == reinterpret_cast<const void*>(&funcRecreate) ? 1 : 0,
+					reinterpret_cast<void*>(static_cast<uintptr_t>(asmB)),
+					static_cast<unsigned long long>(asmI),
+					reinterpret_cast<void*>(static_cast<uintptr_t>(asmB + asmI * 8)),
+					reinterpret_cast<void*>(const_cast<TJitFunc*>(memberBase)),
+					reinterpret_cast<void*>(&jit->dsp()),
+					directCell);
+			}
+		}
+		funcRecreate(_jit, _pc);
 	}
 
 	void funcRecreate(JitDspPtr* _jit, const TWord _pc) noexcept
 	{
-		Jit::toJitPtr(_jit)->recreate(_pc);
+		auto* const jit = Jit::toJitPtr(_jit);
+
+		// 2026-10-13 recreate-pingpong hunt: the caller is inside the generated execUntilCycles.
+		// Its step-1 (interrupt func) call passes only arg0 - a stale RDX (=the previous dispatch
+		// pc, i.e. 0xFF0000) reaches funcRecreate as _pc. If m_interruptFunc points at
+		// funcRecreate, every instrument on table-reading dispatchers stays silent - measured.
+		void* interruptFunc = nullptr;
+		{
+			const auto& f = jit->dsp().getInterruptFunc();
+			interruptFunc = *reinterpret_cast<void* const*>(&f);
+		}
+		{
+			static thread_local int s_pbt = 0;
+			if (s_pbt < 40)
+			{
+				++s_pbt;
+				std::fprintf(stderr, "[BT] funcRecreate(0x%06X) caller=%p interruptFunc=%p intIsRecreate=%d\n",
+					_pc, _ReturnAddress(), interruptFunc, interruptFunc == reinterpret_cast<void*>(&funcRecreate) ? 1 : 0);
+			}
+		}
+
+		// 2026-10-12 memory-appetite hunt: count recreate churn (suspected vector-area ping-pong)
+		g_jitRecreateCount.fetch_add(1, std::memory_order_relaxed);
+		// direct evidence, independent of machine health: every 4096th recreate names its pc
+		if ((g_jitRecreateCount.load(std::memory_order_relaxed) & 4095) == 1)
+			std::fprintf(stderr, "[JIT] funcRecreate #%llu pc=0x%06X slot=%p tid=%llu\n",
+				static_cast<unsigned long long>(g_jitRecreateCount.load(std::memory_order_relaxed)), _pc,
+				*reinterpret_cast<void* const*>(&jit->dsp().getJitEntries()[_pc]),
+				static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+
+		// 2026-10-12 recreate-pingpong hunt: the EXACT dispatched slot value at funcRecreate entry.
+		// If this prints &funcRecreate, the array really held it; if it prints a block func, the
+		// trampoline called funcRecreate through a stale/racing target.
+		{
+			static thread_local int s_p2 = 0;
+			if (s_p2 < 60)
+			{
+				++s_p2;
+				const auto slot = jit->dsp().getJitEntries()[_pc];
+				std::fprintf(stderr, "[WP] funcRecreate entry slot=%p self=%p match=%d\n",
+					*reinterpret_cast<void* const*>(&slot), reinterpret_cast<void*>(&funcRecreate),
+					slot == &funcRecreate ? 1 : 0);
+			}
+		}
+
+		// 2026-10-12: same window check as funcCreate - never index the caches with an out-of-window pc
+		if (_pc >= jit->dsp().memory().sizeP())
+		{
+			static thread_local int s_oobRecreate = 0;
+			if ((++s_oobRecreate & 1023) == 1)
+				std::fprintf(stderr, "[JIT] funcRecreate: pc 0x%06X outside the compiled program window (0x%X) - not recreating\n",
+					_pc, jit->dsp().memory().sizeP());
+			return;
+		}
+
+		// 2026-10-12: same as funcCreate - do not run the recreated block from inside the C++ frame
+		// (see funcCreate above); return and let the dispatch loop pick it up flat.
+		const SetInFuncCreate guard;
+		try
+		{
+			Jit::toJitPtr(_jit)->recreate(_pc);
+		}
+		catch (const std::exception& e)
+		{
+			std::fprintf(stderr, "[JIT-EXC] funcRecreate std::exception at pc 0x%06X: %s\n", _pc, e.what());
+			throw;
+		}
+		catch (...)
+		{
+			std::fprintf(stderr, "[JIT-EXC] funcRecreate unknown exception at pc 0x%06X\n", _pc);
+			throw;
+		}
 	}
 
 	void funcRunCheckPMemWrite(JitDspPtr* _jit, const TWord _pc) noexcept
@@ -179,6 +345,37 @@ namespace dsp56k
 
 	void Jit::recreate(TWord _pc)
 	{
+		// 2026-10-12 recreate-pingpong hunt: the C++ return address names the CALLER - a module
+		// address (~0x7FF...) is C++ dispatch code, an asmjit-pool address is JIT-compiled block
+		// code calling recreate through the table. Symbolize offline via the PDB.
+		{
+			static thread_local int s_pr = 0;
+			if (s_pr < 20)
+			{
+				++s_pr;
+				std::fprintf(stderr, "[TR] Jit::recreate(0x%06X) caller=%p\n", _pc, _ReturnAddress());
+			}
+		}
+		// 2026-10-12 recreate-pingpong hunt: dispatch-state snapshot (capped) - chain count, current
+		// mode and the exact entry value that produced this recreate dispatch.
+		{
+			static thread_local int s_p = 0;
+			if (s_p < 40)
+			{
+				++s_p;
+				const auto& funcs = m_currentChain->getFuncs();
+				const auto entry = _pc < funcs.size() ? funcs[_pc] : nullptr;
+				std::fprintf(stderr, "[JIT] recreate(0x%06X) chains=%u curMode=0x%08X entry=%p coverFirst=0x%06X coverSize=0x%03X entriesPtr=%p liveFuncs=%p %s\n",
+					_pc, static_cast<unsigned>(m_chains.size()),
+					static_cast<unsigned>(m_currentChain->getMode().get()),
+					entry ? *reinterpret_cast<void* const*>(&entry) : nullptr,
+					(m_currentChain->getBlock(_pc) ? m_currentChain->getBlock(_pc)->getPCFirst() : 0xFFFFFF),
+					(m_currentChain->getBlock(_pc) ? m_currentChain->getBlock(_pc)->getPMemSize() : 0),
+					reinterpret_cast<void*>(const_cast<TJitFunc*>(m_dsp.getJitEntries())),
+					reinterpret_cast<void*>(const_cast<TJitFunc*>(m_currentChain->getFuncs().data())),
+					(m_dsp.getJitEntries() == m_currentChain->getFuncs().data()) ? "" : " *** STALE ***");
+			}
+		}
 		m_currentChain->recreate(_pc);
 	}
 
@@ -255,9 +452,32 @@ namespace dsp56k
 		m_maxUsedPAddress = std::max(m_maxUsedPAddress, static_cast<size_t>(_offset));
 	}
 
+	// 2026-10-12 MS2000 memory-appetite hunt: per-second status line counters
+	size_t Jit::getChainCount() const { return m_chains.size(); }
+	size_t Jit::getCurrentBlockCount() const { return m_currentChain ? m_currentChain->getBlockCount() : 0; }
+	size_t Jit::getCurrentCodeSize() const { return m_currentChain ? m_currentChain->getCodeSize() : 0; }
+	uint64_t Jit::getRecreateCount() const { return g_jitRecreateCount.load(std::memory_order_relaxed); }
+
 	void Jit::run(const TWord _pc) noexcept
 	{
 		const auto* block = m_currentChain->getBlockUnsafe(_pc);
+
+		// 2026-10-12 recreate-pingpong hunt: the execOne path dispatches block->getFunc(); if that is
+		// &funcRecreate, we found the 75k/s destroy/re-emit loop's entry. The caller address names
+		// the wrapper (funcRunCheckPMemWrite / ModeChange / LoopEnd / plain).
+		{
+			static thread_local int s_prun = 0;
+			if (s_prun < 20)
+			{
+				++s_prun;
+				std::fprintf(stderr, "[TR] run(0x%06X) blockFirst=0x%06X func=%p isRecreate=%d caller=%p\n",
+					_pc,
+					block ? block->getPCFirst() : 0xFFFFFF,
+					block ? *reinterpret_cast<void* const*>(&block->getFunc()) : nullptr,
+					block && block->getFunc() == &funcRecreate ? 1 : 0,
+					_ReturnAddress());
+			}
+		}
 		m_trampoline.execOne(&m_dsp.regs(), _pc, block->getFunc());
 
 		if(g_traceOps && m_dsp.m_trace)
@@ -443,6 +663,18 @@ namespace dsp56k
 			return;
 
 //		LOG("DSP mode change to " << HEX(mode.get()));
+
+		// 2026-10-12 recreate-pingpong hunt: log every mode transition (capped)
+		{
+			static thread_local int s_p = 0;
+			if (s_p < 40)
+			{
+				++s_p;
+				std::fprintf(stderr, "[JIT] mode change 0x%08X -> 0x%08X (chains=%u)\n",
+					m_currentChain ? static_cast<unsigned>(m_currentChain->getMode().get()) : 0u,
+					static_cast<unsigned>(mode.get()), static_cast<unsigned>(m_chains.size()));
+			}
+		}
 
 		const auto itExisting = m_chains.find(mode);
 

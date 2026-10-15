@@ -14,6 +14,8 @@ namespace dsp56k
 		bool aguSupportMultipleWrapModulo = true;
 		bool cacheSingleOpBlocks = true;
 		bool linkJitBlocks = true;
+		bool linkBackwardJitBlocks = true;	// MS2000 VOC-DEATH-3: false = only forward links (loops return to the dispatcher)
+		bool linkCheckInterrupts = false;	// MS2000 VOC-DEATH-3b: a linked jump returns to the dispatcher while an interrupt request waits (x64)
 		bool splitOpsByNops = false;
 		bool dynamicPeripheralAddressing = false;
 

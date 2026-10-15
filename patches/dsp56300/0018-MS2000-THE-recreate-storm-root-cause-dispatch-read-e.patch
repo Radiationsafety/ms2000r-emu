@@ -1,0 +1,326 @@
+From df20ed007a95851694f208814764d1cdf874d2d8 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Tue, 13 Oct 2026 22:58:48 +0200
+Subject: [PATCH 18/24] MS2000: THE recreate-storm root cause - dispatch read
+ entries[pc+1] (one displacement)
+
+THE ROOT CAUSE, proven by hexdump of the generated trampoline:
+
+  4D 8B 44 D0 08   =   mov r8, [r8 + rdx*8 + 8]
+
+The execUntilCycles dispatch load was written as
+  m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3, 8));
+intending scale=3 and access size=8 - but asmjit's 4th mem operand argument is
+the DISPLACEMENT. The generated loop read entries[pc + 1] instead of entries[pc].
+
+Consequences, all measured:
+- For every pc inside a multi-word block, entries[pc+1] is the block's own
+  interior mark &funcRecreate. The bootstrap dispatch at P:0xFF0000 loaded its
+  own block's interior mark and called funcRecreate(0xFF0000) forever:
+  the ~75k/s destroy+re-emit storm (pre makeRoom-fix), 4+ GB asmjit pool
+  (retired code never released while the trampoline stayed entered), warden
+  kills, and after the makeRoom abort-fix a ~2.4 billion/run no-op livelock
+  with zero boot progress.
+- Every "phantom funcRecreate from the table with no writer" observation fits:
+  the writers wrote the marks to pc+1; the instruments watched pc. The cell
+  hexdump/direct-read comparison (directCell vs loaded) closed it.
+
+THE FIX: ptr(base, index, 3) - no displacement. Jitmem::makePtr's 4th argument
+IS a size (the execLoop uses it correctly); only the raw asmjit::x86::ptr call
+in execUntilCycles had the displacement. (PERF-DSP-2, my own code.)
+
+AFTER (bankstorm, 30 s run, warden 4096 MB):
+- t= lines RETURN: boot advances, t=4.53/5.53/6.53 s heartbeat, DSP executes
+  the real firmware in low P (PC=0003D7/000521/00012E, SR=C00150/C00049),
+  H8S<->DSP traffic alive (SHI words in 139K, TX frames 264K, RX overruns 0),
+  JIT healthy (chains=1, blocks=271, codeMB=0.27), ~2x real-time.
+- recreates=15 TOTAL per run (was: billions) - the surviving ones are the
+  legitimate mid-block entry at P:0xFF001A (the MS2k "upload stage-1, reconfigure
+  memory, jump back to bootloader" flow) doing exactly what recreate was
+  designed for: split once, continue.
+- Memory flat. No warden kill.
+
+Also in this commit (instruments, all capped/rate-limited): honest ASM
+funcRecreate-compare trace (materialized imm64 - cmp r64,imm64 does not exist),
+baked base/index globals, direct-cell read, generated-code hexdump, cell write
+log with thread ids, makeRoom starts-here abort (kept - it is correct defense:
+a block that starts at _pc is valid for _pc, destroyToRecreate skips it for the
+same reason), hot-entry forced block boundaries, chain/block/recreate counters.
+
+Next, separate bug (known from the H-bank session): at t~6.5 s the bankstorm
+program change drives the DSP to the wild pc 0x800010 (valid 24-bit P address,
+unmapped physical page); the legitimate recreate there hits bad_alloc in the
+memory model and terminates the host. The window guard passes because 0x800010
+< sizeP(0x1000000); the fix belongs in the memory model / wild-pc handling.
+---
+ source/dsp56kEmu/jit.cpp           | 41 ++++++++++++++++++++++--------
+ source/dsp56kEmu/jitblockchain.cpp | 38 +++++++++++++++++----------
+ source/dsp56kEmu/jittrampoline.cpp | 41 +++++++++++++++++++++++++-----
+ source/dsp56kEmu/jittrampoline.h   | 22 ++++++++++++++++
+ 4 files changed, 111 insertions(+), 31 deletions(-)
+
+diff --git a/source/dsp56kEmu/jit.cpp b/source/dsp56kEmu/jit.cpp
+index 3d926f3f..8f90a4f8 100644
+--- a/source/dsp56kEmu/jit.cpp
++++ b/source/dsp56kEmu/jit.cpp
+@@ -1,6 +1,8 @@
+ #include "jit.h"
+ 
+ #include <intrin.h>
++#include <thread>
++#include <functional>
+ 
+ // 2026-10-12 recreate-pingpong hunt: minimal kernel32 declarations - including <windows.h> breaks
+ // fastmath.h with macro clashes, so declare the three APIs and the two flags we need.
+@@ -158,16 +160,26 @@ namespace dsp56k
+ 		auto* const jit = Jit::toJitPtr(_jit);
+ 		{
+ 			static thread_local int s_p = 0;
++			extern volatile uint64_t g_dbgAsmBase;
++			extern volatile uint64_t g_dbgAsmIndex;
+ 			if (s_p < 60)
+ 			{
+ 				++s_p;
+ 				const auto slot = jit->dsp().getJitEntries()[_pc];
+-				std::fprintf(stderr, "[TR] pc=0x%06X loaded=%p slotNow=%p self=%p matchLoad=%d matchSlot=%d\n",
++				const auto memberBase = jit->dsp().getJitEntries();
++				const auto asmB = g_dbgAsmBase;			// single reads - volatiles are raced by the other thread's iterations
++				const auto asmI = g_dbgAsmIndex;
++				const void* directCell = *reinterpret_cast<void* const*>(static_cast<uintptr_t>(asmB + asmI * 8));
++				std::fprintf(stderr, "[TR] pc=0x%06X loaded=%p slotNow=%p matchLoad=%d asmBase=%p asmIdx=0x%llX cell=%p ccBase=%p dspNow=%p directCell=%p\n",
+ 					_pc, _loaded,
+ 					*reinterpret_cast<void* const*>(&slot),
+-					reinterpret_cast<void*>(&funcRecreate),
+ 					_loaded == reinterpret_cast<const void*>(&funcRecreate) ? 1 : 0,
+-					slot == &funcRecreate ? 1 : 0);
++					reinterpret_cast<void*>(static_cast<uintptr_t>(asmB)),
++					static_cast<unsigned long long>(asmI),
++					reinterpret_cast<void*>(static_cast<uintptr_t>(asmB + asmI * 8)),
++					reinterpret_cast<void*>(const_cast<TJitFunc*>(memberBase)),
++					reinterpret_cast<void*>(&jit->dsp()),
++					directCell);
+ 			}
+ 		}
+ 		funcRecreate(_jit, _pc);
+@@ -177,15 +189,22 @@ namespace dsp56k
+ 	{
+ 		auto* const jit = Jit::toJitPtr(_jit);
+ 
+-		// 2026-10-12 recreate-pingpong hunt: the caller chain. The ASM dispatch (execUntilCycles) is
+-		// traced separately and NEVER loads funcRecreate - so the calls come through the execOne
+-		// path. This return address lands inside the generated execOne trampoline.
++		// 2026-10-13 recreate-pingpong hunt: the caller is inside the generated execUntilCycles.
++		// Its step-1 (interrupt func) call passes only arg0 - a stale RDX (=the previous dispatch
++		// pc, i.e. 0xFF0000) reaches funcRecreate as _pc. If m_interruptFunc points at
++		// funcRecreate, every instrument on table-reading dispatchers stays silent - measured.
++		void* interruptFunc = nullptr;
++		{
++			const auto& f = jit->dsp().getInterruptFunc();
++			interruptFunc = *reinterpret_cast<void* const*>(&f);
++		}
+ 		{
+ 			static thread_local int s_pbt = 0;
+-			if (s_pbt < 6)
++			if (s_pbt < 40)
+ 			{
+ 				++s_pbt;
+-				std::fprintf(stderr, "[BT] funcRecreate(0x%06X) caller=%p\n", _pc, _ReturnAddress());
++				std::fprintf(stderr, "[BT] funcRecreate(0x%06X) caller=%p interruptFunc=%p intIsRecreate=%d\n",
++					_pc, _ReturnAddress(), interruptFunc, interruptFunc == reinterpret_cast<void*>(&funcRecreate) ? 1 : 0);
+ 			}
+ 		}
+ 
+@@ -193,8 +212,10 @@ namespace dsp56k
+ 		g_jitRecreateCount.fetch_add(1, std::memory_order_relaxed);
+ 		// direct evidence, independent of machine health: every 4096th recreate names its pc
+ 		if ((g_jitRecreateCount.load(std::memory_order_relaxed) & 4095) == 1)
+-			std::fprintf(stderr, "[JIT] funcRecreate #%llu pc=0x%06X\n",
+-				static_cast<unsigned long long>(g_jitRecreateCount.load(std::memory_order_relaxed)), _pc);
++			std::fprintf(stderr, "[JIT] funcRecreate #%llu pc=0x%06X slot=%p tid=%llu\n",
++				static_cast<unsigned long long>(g_jitRecreateCount.load(std::memory_order_relaxed)), _pc,
++				*reinterpret_cast<void* const*>(&jit->dsp().getJitEntries()[_pc]),
++				static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+ 
+ 		// 2026-10-12 recreate-pingpong hunt: the EXACT dispatched slot value at funcRecreate entry.
+ 		// If this prints &funcRecreate, the array really held it; if it prints a block func, the
+diff --git a/source/dsp56kEmu/jitblockchain.cpp b/source/dsp56kEmu/jitblockchain.cpp
+index 1489228a..09f4319e 100644
+--- a/source/dsp56kEmu/jitblockchain.cpp
++++ b/source/dsp56kEmu/jitblockchain.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <atomic>
+ #include <intrin.h>
++#include <thread>
++#include <functional>
+ 
+ #include "dsp.h"
+ #include "jitasmjithelpers.h"
+@@ -114,19 +116,20 @@ namespace dsp56k
+ 		const auto first = _block->getPCFirst();
+ 		const auto last = first + _block->getPMemSize();
+ 
+-		// 2026-10-12 recreate-pingpong hunt: watchpoint on the hot word. The earlier count-capped
+-		// print was blind after the first 300 boot occupies; what decides the case is an INTERIOR
+-		// write at 0xFF0000 (a covering block from below), which must not happen if the planner's
+-		// isExistingCode check works - and if it happens, who did it.
+-		if (first <= 0xFF0000 && 0xFF0000 < last && first != 0xFF0000)
++		// 2026-10-13 hunt: log EVERY write to the hot cell - first word AND interior - with the
++		// writing thread and the caller. The honest ASM trace proved the dispatch really reads
++		// &funcRecreate from this cell, but no instrumented writer has ever been seen writing it.
++		if (first <= 0xFF0000 && 0xFF0000 < last)
+ 		{
+ 			static thread_local int s_p = 0;
+-			if (s_p < 20) { ++s_p; std::fprintf(stderr, "[WP] INTERIOR-OCCUPY AT 0xFF0000! block=[0x%06X..+0x%03X) caller=%p\n", first, static_cast<unsigned>(_block->getPMemSize()), _ReturnAddress()); }
+-		}
+-		else if (first == 0xFF0000)
+-		{
+-			static thread_local int s_pFirst = 0;
+-			if (s_pFirst < 3) { ++s_pFirst; std::fprintf(stderr, "[WP] OCCUPY block=[0x%06X..+0x%03X) hotWord=FIRST\n", first, static_cast<unsigned>(_block->getPMemSize())); }
++			if (s_p < 40)
++			{
++				++s_p;
++				std::fprintf(stderr, "[CELL] OCCUPY [0x%06X..+0x%03X) hot=%s tid=%llu caller=%p\n",
++					first, static_cast<unsigned>(_block->getPMemSize()), (first == 0xFF0000) ? "FIRST" : "INTERIOR",
++					static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())),
++					_ReturnAddress());
++			}
+ 		}
+ 
+ 		ensureSize(last - 1);
+@@ -153,11 +156,18 @@ namespace dsp56k
+ 
+ 		for(auto i=first; i<last; ++i)
+ 		{
+-			// 2026-10-12 recreate-pingpong hunt: watchpoint on the hot word
++			// 2026-10-13 hunt: log every write to the hot cell (both branches; unoccupy writes funcCreate)
+ 			if (i == 0xFF0000)
+ 			{
+-				static thread_local int s_p = 0;
+-				if (s_p < 300) { ++s_p; std::fprintf(stderr, "[WP] UNOCCUPY block=[0x%06X..+0x%03X) hotWord=%s\n", first, static_cast<unsigned>(_block->getPMemSize()), (first == 0xFF0000) ? "FIRST" : "INTERIOR"); }
++				static thread_local int s_pu = 0;
++				if (s_pu < 40)
++				{
++					++s_pu;
++					std::fprintf(stderr, "[CELL] UNOCCUPY [0x%06X..+0x%03X) tid=%llu caller=%p\n",
++						first, static_cast<unsigned>(_block->getPMemSize()),
++						static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id())),
++						_ReturnAddress());
++				}
+ 			}
+ 			m_jitCache[i].block = nullptr;
+ 			m_jitFuncs[i] = &funcCreate;
+diff --git a/source/dsp56kEmu/jittrampoline.cpp b/source/dsp56kEmu/jittrampoline.cpp
+index 2c6ff742..4a7bc6a6 100644
+--- a/source/dsp56kEmu/jittrampoline.cpp
++++ b/source/dsp56kEmu/jittrampoline.cpp
+@@ -8,10 +8,14 @@
+ 
+ namespace dsp56k
+ {
+-	// 2026-10-12 recreate-pingpong hunt: defined in jit.cpp
++	// 2026-10-13 recreate-pingpong hunt: defined in jit.cpp
+ 	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;
+ 	void funcRecreateTrace(JitDspPtr* _jit, TWord _pc, const void* _loaded) noexcept;
+ 
++	// 2026-10-13 hunt: written by the generated execUntilCycles before the dispatch table read
++	volatile uint64_t g_dbgAsmBase = 0;
++	volatile uint64_t g_dbgAsmIndex = 0;
++
+ #ifdef HAVE_ARM64
+ 	constexpr auto g_ptrDSP = JitReg64(22);
+ 	constexpr auto g_counter = JitReg64(23);
+@@ -353,6 +357,17 @@ namespace dsp56k
+ 		// 2) the block at the current PC: (DspRegs*, PC)
+ 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
+ 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
++
++		// 2026-10-13 hunt: bake the base and index the ASM is about to use into globals, so the
++		// trace thunk can print the exact cell address the dispatch reads - the C++ read of the
++		// same logical cell stably returns a different value, so the addressing must differ.
++		{
++			m_asm.mov(asmjit::x86::r11, asmjit::Imm(reinterpret_cast<uint64_t>(&g_dbgAsmBase)));
++			m_asm.mov(asmjit::x86::ptr(asmjit::x86::r11, 0, 8), r64(g_funcToCall));
++			m_asm.mov(asmjit::x86::r11, asmjit::Imm(reinterpret_cast<uint64_t>(&g_dbgAsmIndex)));
++			m_asm.mov(asmjit::x86::ptr(asmjit::x86::r11, 0, 8), r64(g_funcArgGPs[1]));
++		}
++
+ 		// 2026-10-12 MS2000 H-bank crash hunt: never dispatch a pc outside the JIT-covered program
+ 		// window. m_jitEntries is sized memory().sizeP(); an out-of-window pc (measured 0x800010
+ 		// during the H-bank program change) reads a function pointer past the table and calls
+@@ -364,21 +379,33 @@ namespace dsp56k
+ 		// model is configured, this could be a tiny window and the bootstrap at 0xFF0000 would exit
+ 		std::fprintf(stderr, "[JIT-TRAMP] execUntilCycles dispatch window baked = 0x%zX\n",
+ 			static_cast<size_t>(m_dsp.memory().sizeP()));
+-		m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3, 8));
++		// 2026-10-13 THE FIX: the original dispatch load was
++		//     ptr(base, index, 3, 8) - asmjit's 4th mem operand argument is the DISPLACEMENT,
++		// not the access size. The generated code read [entries + pc*8 + 8] = entries[pc+1]:
++		// for every pc inside a multi-word block that is the block's own interior mark
++		// (&funcRecreate). The bootstrap dispatch at P:0xFF0000 loaded its own block's interior
++		// mark and re-created itself ~billions of times per run (the whole recreate storm,
++		// the 4+ GB leak and the boot livelock all came from this one displacement).
++		m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3));
+ 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
+ 
+ 		// 2026-10-12 recreate-pingpong hunt: when the loaded target is funcRecreate, call the trace
+ 		// thunk instead, passing the exact loaded pointer - it prints loaded vs slot-now before
+ 		// performing the original call.
++		// 2026-10-13 FIX 1: cmp r64, imm64 does not exist on x86 - materialize into a register.
++		// 2026-10-13 FIX 2: g_funcToCall aliases g_funcArgGPs[2] (both r8) - the previous arg setup
++		// clobbered the value. Compare via scratchA/scratchB and pass the value honestly; the
++		// trace call goes through rax, which the loop reloads right after anyway.
+ 		{
+ 			const auto lNormalCall = m_asm.newLabel();
+ 			const auto lAfterCall = m_asm.newLabel();
+-			m_asm.mov(scratchA, r64(g_funcToCall));						// save the loaded value
+-			m_asm.cmp(r64(g_funcToCall), asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreate)));
++			m_asm.mov(scratchA, r64(g_funcToCall));						// r10 = the loaded value
++			m_asm.mov(scratchB, asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreate)));
++			m_asm.cmp(r64(scratchA), r64(scratchB));					// cmp r10, r11
+ 			m_asm.jne(lNormalCall);
+-			m_asm.mov(r64(g_funcArgGPs[2]), r64(scratchA));			// arg2 = the loaded TJitFunc
+-			m_asm.mov(r64(g_funcToCall), asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreateTrace)));
+-			m_asm.call(r64(g_funcToCall));
++			m_asm.mov(r64(g_funcArgGPs[2]), r64(scratchA));			// r8 = the loaded value (arg2)
++			m_asm.mov(asmjit::x86::rax, asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreateTrace)));
++			m_asm.call(asmjit::x86::rax);
+ 			m_asm.jmp(lAfterCall);
+ 			m_asm.bind(lNormalCall);
+ 			m_asm.call(r64(g_funcToCall));
+diff --git a/source/dsp56kEmu/jittrampoline.h b/source/dsp56kEmu/jittrampoline.h
+index 247a14a2..05d64713 100644
+--- a/source/dsp56kEmu/jittrampoline.h
++++ b/source/dsp56kEmu/jittrampoline.h
+@@ -37,6 +37,28 @@ namespace dsp56k
+ 			generateExecLoopFunc();
+ 			generateExecOneFunc();
+ 			generateExecUntilCyclesFunc();
++
++			// 2026-10-13 hunt: the ASM's baked offsets are relative to THIS &m_dsp. If the DSP
++			// object moves after generation (move/copy in the host wrapper), every [dsp+off] read
++			// hits a wrong cell - measured: the dispatch's "entries base" reads a module .data
++			// address instead of the table base, and the indexed read then finds &funcRecreate in
++			// a .data cell - the entire recreate storm.
++			std::fprintf(stderr, "[TRAMP] genDspAddr=%p execLoop=%p execOne=%p execUntilCycles=%p funcRecreate=%p\n",
++				reinterpret_cast<void*>(&m_dsp),
++				reinterpret_cast<void*>(m_funcExecLoop),
++				reinterpret_cast<void*>(m_funcExecOne),
++				reinterpret_cast<void*>(m_funcExecUntilCycles),
++				reinterpret_cast<void*>(&funcRecreate));
++
++			// 2026-10-13 hunt: hexdump the generated execUntilCycles dispatch - the ASM reads
++			// &funcRecreate from a cell the C++ reads as the block func; decode the real encoding.
++			{
++				const auto* p = reinterpret_cast<const unsigned char*>(m_funcExecUntilCycles);
++				std::fprintf(stderr, "[TRAMP] execUntilCycles bytes:");
++				for (size_t i = 0; i < 192; ++i)
++					std::fprintf(stderr, "%02X", p[i]);
++				std::fprintf(stderr, "\n");
++			}
+ 		}
+ 
+ 		void exec(DSP* _dsp, uint32_t _count) noexcept
+-- 
+2.49.0.windows.1
+

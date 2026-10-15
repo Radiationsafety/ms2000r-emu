@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <vector>
+#include <set>
 
 #include "jitcacheentry.h"
 #include "jitdspmode.h"
@@ -31,6 +32,12 @@ namespace dsp56k
 
 		JitBlockRuntimeData* getChildBlock(JitBlockRuntimeData* _parent, TWord _pc, bool _allowCreate = true);
 		JitBlockRuntimeData* emit(TWord _pc);
+
+		// 2026-10-12 MS2000 memory-appetite hunt: live-block count + code size for the status line
+		size_t getBlockCount() const { return m_blockCount; }
+		size_t getCodeSize() const { return m_codeSize; }
+		// 2026-10-12 recreate-pingpong fix: the forced block-boundary set (see Jit::markRecreateEntry)
+		const std::set<TWord>& getForcedSplits() const;
 
 		JitBlockRuntimeData* getBlock(const TWord _pc) const
 		{
@@ -119,5 +126,6 @@ namespace dsp56k
 		std::unique_ptr<AsmJitErrorHandler> m_errorHandler;
 
 		size_t m_codeSize = 0;
+		size_t m_blockCount = 0;	// 2026-10-12 MS2000 memory-appetite hunt: live blocks (emit ++ / release --)
 	};
 }

@@ -21,6 +21,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <cstdlib>
+#include <filesystem>
+#include "core/rom_paths.h"
 #include <cmath>
 
 namespace {
@@ -29,10 +31,13 @@ std::atomic<int> g_liveProcessors{ 0 };   // MULTI-1: read by the loader module 
 
 bool validHome(const juce::File& d)
 {
-    // BOOTROM-1: the public boot-362.bin is enough - the emulator corrects its two words in memory
-    const auto fw = d.getChildFile("full FW");
-    return d.getChildFile("flash.bin").existsAsFile()
-        && (fw.getChildFile("boot-362.ms2000.bin").existsAsFile() || fw.getChildFile("boot-362.bin").existsAsFile());
+    // BOOTROM-1: the public boot-362.bin is enough - the emulator corrects its two words in memory.
+    // ROM-PATHS-1: beside flash.bin or in its "full FW" subfolder (rom_paths.h)
+    return ms2k::hasRoms(std::filesystem::path(d.getFullPathName().toWideCharPointer()));
+}
+juce::String missingRoms(const juce::File& d)
+{
+    return juce::String(ms2k::missingRoms(std::filesystem::path(d.getFullPathName().toWideCharPointer())));
 }
 // HOME-1 (2026-10-01): the folder picked in Settings, kept for every instance and project
 juce::File homeSetting() { return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("MS2000R").getChildFile("home.txt"); }
@@ -348,7 +353,7 @@ bool Ms2kProcessor::bootMachine()
     m_owner = true;
     m_home = findHome();
     if (m_home == juce::File()) {
-        setStatus("The MS2000 folder (flash.bin + full FW\\boot-362.bin) was not found - Settings: Choose the MS2000 folder.");
+        setStatus("The MS2000 folder (flash.bin + boot-362.bin, the latter beside it or in its 'full FW' subfolder) was not found - Settings: Choose the MS2000 folder.");
         return false;
     }
     m_home.setAsCurrentWorkingDirectory();
@@ -360,7 +365,7 @@ bool Ms2kProcessor::bootMachine()
 // HOME-1: the folder chosen in Settings - saved for every instance; powers the machine on if it is not running yet
 bool Ms2kProcessor::chooseHome(const juce::File& d)
 {
-    if (!validHome(d)) { setStatus("No flash.bin + full FW\\boot-362.bin in " + d.getFullPathName()); return false; }
+    if (!validHome(d)) { setStatus("Missing in " + d.getFullPathName() + ": " + missingRoms(d)); return false; }
     homeSetting().getParentDirectory().createDirectory();
     homeSetting().replaceWithText(d.getFullPathName());
     if (m_runner) { setStatus("Saved: " + d.getFullPathName() + " - used from the next start"); return true; }
@@ -435,7 +440,18 @@ void Ms2kProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuf
     const int N = buffer.getNumSamples();
     std::unique_lock<std::mutex> machine(m_machineMx, std::try_to_lock);   // a reboot holds it: silence
     pollParams(machine.owns_lock() && m_runner);                            // AUTOMATION-1: host automation -> panel
-    if (!machine.owns_lock() || !m_runner || N <= 0) { buffer.clear(); midi.clear(); return; }
+    if (!machine.owns_lock() || !m_runner || N <= 0) {
+        {   // 2026-10-14 MIDI-DROP instrument (capped): with the SMF loaded every block died here -
+            // which gate was it? (the [MIDI-COLL] prints never appeared at all in that run)
+            static unsigned n = 0;
+            if (n < 12) { ++n;
+                std::fprintf(stderr, "[PB-DROP] lock=%d runner=%d N=%d t=%.2f s\n",
+                             machine.owns_lock() ? 1 : 0, m_runner ? 1 : 0, N,
+                             double(m_frames.load(std::memory_order_relaxed)) / m_hostRate);
+            }
+        }
+        buffer.clear(); midi.clear(); return;
+    }
     auto* dsp = m_runner->getEmulator().dsp();
 
     // DEMO-FMT-1 diag (off unless set): MS2K_DEMOAT=<s> presses the demo keys at that machine time, as the Settings
@@ -445,6 +461,82 @@ void Ms2kProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuf
         if (m_demoDiag == 0 && t >= t0) { setSwitch(4, 0, true); m_demoDiag = 1; }
         else if (m_demoDiag == 1 && t >= t0 + 0.2) { setSwitch(3, 6, true); m_demoDiag = 2; }
         else if (m_demoDiag == 2 && t >= t0 + 1.4) { setSwitch(3, 6, false); setSwitch(4, 0, false); m_demoDiag = 3; }
+    }
+    // BUG3 diag (off unless set): MS2K_DEMOYES=<s>:<n> presses +/YES (SS4 T4) n times from machine time s, 0.3 s
+    // down / 0.3 s up - the demo song selector of the owner's manual, so a run can start at a given demo song
+    if (static const char* demoYes = std::getenv("MS2K_DEMOYES"); demoYes) {
+        static const double y0 = std::atof(demoYes);
+        static const int yn = std::strchr(demoYes, ':') ? std::atoi(std::strchr(demoYes, ':') + 1) : 0;
+        static int yState = 0;   // 2k = up before press k, 2k+1 = down
+        const double t = double(m_frames.load(std::memory_order_relaxed)) / m_hostRate;
+        if (yState < 2 * yn && t >= y0 + 0.3 * yState) { setSwitch(4, 4, (yState & 1) == 0); ++yState; }
+    }
+
+    // BANKSTORM diag (off unless set; H-bank vocoder hunt 2026-10-12): MS2K_BANKSTORM=<start s>,<period ms>,<hold ms>,<seed>[,<mode>]
+    // At <start> s presses BANK/OCTAVE DOWN (switch 2,7) for 0.3 s to select bank H, then every <period> ms presses
+    // a program pad: mode 0 = pseudo-random 1-16, mode 1 = the H08..H16 ping-pong walk (up then down, as on the panel).
+    // Logs per press the LCD lines to %TEMP%\ms2k_bankstorm.log - the H12/H13 program-change death shows there.
+    if (static const char* bs = std::getenv("MS2K_BANKSTORM"); bs) {
+        static double b0 = 3.0, bper = 150.0, bhold = 50.0; static unsigned bseed = 1; static int bmode = 0;
+        static const bool bparsed = std::sscanf(bs, "%lf,%lf,%lf,%u,%d", &b0, &bper, &bhold, &bseed, &bmode) > 0;
+        (void)bparsed;
+        const double t = double(m_frames.load(std::memory_order_relaxed)) / m_hostRate;
+        auto padSw = [this](int k, bool d) { setSwitch(k < 8 ? 6u : 5u, 7u - unsigned(k % 8), d); };
+        if (bmode == 4) {
+            // control: no bank switch at all - straight into the pad walk, pads in bank A
+            if (m_bankStormPhase == 0 && t >= b0) { m_bankStormPhase = 2; m_bankStormN = -1; }
+        }
+        // phase 0: press BANK DOWN at b0, release at b0+0.3 -> bank H
+        if (m_bankStormPhase == 0 && t >= b0) { setSwitch(2u, 7u, true); m_bankStormPhase = 1; }
+        else if (m_bankStormPhase == 1 && t >= b0 + 0.3) { setSwitch(2u, 7u, false); m_bankStormPhase = 2; m_bankStormN = -1; }
+        // phase 2: the program-pad storm in bank H
+        else if (m_bankStormPhase == 2 && t >= b0 + 1.0) {
+            const long n = long((t - b0 - 1.0) * 1000.0 / bper);
+            const double ph = (t - b0 - 1.0) * 1000.0 - double(n) * bper;
+            if (n != m_bankStormN) {
+                if (m_bankStormDown) padSw(m_bankStormPad, false);
+                int k;
+                if (bmode == 1 || bmode == 3 || bmode == 4) {
+                    // walk 08..16 (indices 7..15) up then down: 7,8,...,15,14,...,8,7,...
+                    const long tri = n % 16;
+                    k = tri < 9 ? 7 + int(tri) : 7 + int(16 - tri);
+                    // mode 3 control: BANK UP once in the middle (n=150) - do pads come back to life in bank A?
+                    if (bmode == 3) {
+                        if (n == 150 && m_bankStormBankUp == 0) { setSwitch(2u, 6u, true); m_bankStormBankUp = 1; }
+                        else if (n == 151 && m_bankStormBankUp == 1) { setSwitch(2u, 6u, false); m_bankStormBankUp = 2; }
+                    }
+                } else if (bmode == 2) {
+                    // the vocoder suspects only: ping-pong over H08..H14 (indices 7..13)
+                    const long tri = n % 12;
+                    k = tri < 7 ? 7 + int(tri) : 7 + int(12 - tri);
+                } else if (bmode == 5) {
+                    // VOC-DEATH-2: an explicit pad list, one press per period - MS2K_BANKSEQ="13,9,8" (pads 1-16,
+                    // 0 = no press in that period); after the list, no more presses
+                    static const std::vector<int> seq = [] { std::vector<int> v; const char* e = std::getenv("MS2K_BANKSEQ");
+                        for (const char* p = e; p && *p; ) { v.push_back(std::atoi(p)); p = std::strchr(p, ','); if (p) ++p; } return v; }();
+                    k = n >= 0 && size_t(n) < seq.size() ? seq[size_t(n)] - 1 : -1;
+                } else {
+                    bseed = bseed * 1103515245u + 12345u;
+                    k = int((bseed >> 16) % 16u);
+                }
+                if (k < 0) { m_bankStormN = n; m_bankStormDown = false; } else {   // mode 5: no press this period
+                const LcdGuiSnapshot s = m_runner->getLcdGuiSnapshot();
+                char l0[17], l1[17];
+                for (int i = 0; i < 16; ++i) { l0[i] = s.line0[i] >= 32 ? s.line0[i] : ' '; l1[i] = s.line1[i] >= 32 ? s.line1[i] : ' '; }
+                l0[16] = l1[16] = 0;
+                static const std::string blogPath = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\ms2k_bankstorm.log";
+                if (FILE* f = std::fopen(blogPath.c_str(), "a")) {
+                    std::fprintf(f, "%9.3f pad %2d | %s | %s\n", t, k + 1, l0, l1);
+                    std::fclose(f);
+                }
+                m_bankStormPad = k; m_bankStormN = n;
+                padSw(k, true);
+                m_bankStormDown = true;
+                }
+            } else if (m_bankStormDown && ph >= bhold) {
+                padSw(m_bankStormPad, false); m_bankStormDown = false;
+            }
+        }
     }
 
     // PADSTORM diag (off unless set; FREEZE-PC hunt 2026-10-08): MS2K_PADSTORM=<start s>,<period ms>,<hold ms>,<seed>
@@ -572,6 +664,17 @@ void Ms2kProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuf
         ev.frame = off; ev.len = uint8_t(len);
         for (int i = 0; i < len; ++i) ev.data[i] = raw[i];
         m_midiIn.push_back(ev);
+    }
+    {   // 2026-10-14 MIDI-COLL instrument (capped): zero [MIDI-PUSH] prints though the SMF put
+        // events into processBlock - where do they die? evs=0 here means the buffer was empty on
+        // arrival (early-return dropped it); evs>0 with toRender>0 means they ride the render path.
+        static unsigned n = 0;
+        if (m_midiIn.size() > 0 || n < 6) { if (n < 24) { ++n;
+            const auto& ev0 = m_midiIn.empty() ? MS2000::Ms2kRunner::MidiEv{} : m_midiIn.front();
+            std::fprintf(stderr, "[MIDI-COLL] t=%.2f evs=%zu ev0.frame=%u toRender=%u have=%zu (print %u)\n",
+                         double(m_frames.load(std::memory_order_relaxed)) / m_hostRate,
+                         m_midiIn.size(), ev0.frame, toRender, have, n);
+        } }
     }
     midi.clear();
 

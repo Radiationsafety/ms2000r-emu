@@ -2,11 +2,19 @@
 
 #include <cstdint>
 #include <vector>
+#include <cstdio>
+#include <intrin.h>
 
 #include "jitasmjithelpers.h"
 #include "jittypes.h"
 
 #include "asmjit/core/jitruntime.h"
+
+namespace dsp56k
+{
+	// 2026-10-12 recreate-pingpong hunt: defined in jit.cpp
+	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;
+}
 
 namespace dsp56k
 {
@@ -29,6 +37,28 @@ namespace dsp56k
 			generateExecLoopFunc();
 			generateExecOneFunc();
 			generateExecUntilCyclesFunc();
+
+			// 2026-10-13 hunt: the ASM's baked offsets are relative to THIS &m_dsp. If the DSP
+			// object moves after generation (move/copy in the host wrapper), every [dsp+off] read
+			// hits a wrong cell - measured: the dispatch's "entries base" reads a module .data
+			// address instead of the table base, and the indexed read then finds &funcRecreate in
+			// a .data cell - the entire recreate storm.
+			std::fprintf(stderr, "[TRAMP] genDspAddr=%p execLoop=%p execOne=%p execUntilCycles=%p funcRecreate=%p\n",
+				reinterpret_cast<void*>(&m_dsp),
+				reinterpret_cast<void*>(m_funcExecLoop),
+				reinterpret_cast<void*>(m_funcExecOne),
+				reinterpret_cast<void*>(m_funcExecUntilCycles),
+				reinterpret_cast<void*>(&funcRecreate));
+
+			// 2026-10-13 hunt: hexdump the generated execUntilCycles dispatch - the ASM reads
+			// &funcRecreate from a cell the C++ reads as the block func; decode the real encoding.
+			{
+				const auto* p = reinterpret_cast<const unsigned char*>(m_funcExecUntilCycles);
+				std::fprintf(stderr, "[TRAMP] execUntilCycles bytes:");
+				for (size_t i = 0; i < 192; ++i)
+					std::fprintf(stderr, "%02X", p[i]);
+				std::fprintf(stderr, "\n");
+			}
 		}
 
 		void exec(DSP* _dsp, uint32_t _count) noexcept
@@ -41,6 +71,20 @@ namespace dsp56k
 
 		void execOne(JitDspPtr* _jit, const TWord _pc, const TJitFunc _func) noexcept
 		{
+			// 2026-10-12 recreate-pingpong hunt: the recreate storm is dispatched through this
+			// trampoline entry while every table-reading dispatcher is instrumented and silent.
+			// The C++ caller's return address (a module address) names the dispatch path.
+#ifdef _WIN32
+			if (_func == &funcRecreate)
+			{
+				static thread_local int s_p = 0;
+				if (s_p < 10)
+				{
+					++s_p;
+					std::fprintf(stderr, "[TR] execOne(funcRecreate) pc=0x%06X caller=%p\n", _pc, _ReturnAddress());
+				}
+			}
+#endif
 			++m_running;
 			m_funcExecOne(_jit, _pc, _func);
 			stopped();

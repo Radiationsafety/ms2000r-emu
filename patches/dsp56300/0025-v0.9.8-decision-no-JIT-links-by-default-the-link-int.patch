@@ -1,0 +1,40 @@
+From 82173710295d329c34fc23b76accbfd70c61ac6b Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Thu, 15 Oct 2026 05:09:26 +0200
+Subject: [PATCH] v0.9.8 decision: no JIT links by default; the link interrupt
+ check kept as MS2K_DSPLINK=check
+
+bc9a9e8 also cleared DSP::m_jitIrqCheck when the last request was taken. Measured with [JOBLEN]
+(30 s H09-H16 walk): that let 2-7 % of the per-sample jobs run past the 2083-cycle fs period again
+(max 3939 cycles; no resets, but late interrupts). Without that clear (only the dispatcher's "nothing
+takeable" clears the flag): 0 jobs > 2083, max 1987 - and the speed equals plain unlinked blocks:
+links+check 8.00/8.18 s, unlinked 7.98/8.05 s at 20.5 s of MCU time (old links 7.62-7.65 s).
+So the release default is the library's own linkJitBlocks = false (no new code on the hot path);
+MS2K_DSPLINK=check keeps the link check for later optimisation, =all the old links, =fwd forward only.
+The 27 % (was 23 %) VSTHost load Tamas measured is the cost of computing all 48000 samples per second
+(v0.9.7 dropped up to half in vocoder programs) plus the prompt interrupts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hob75q4ASH4mPmALoirbn6
+---
+ source/dsp56kEmu/dsp.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 836fde06..25f9a6e5 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -392,7 +392,9 @@ namespace dsp56k
+ 
+ 		m_processingMode = FastInterrupt;
+ 		m_pendingInterrupts.pop_front();
+-		m_jitIrqCheck = m_pendingInterrupts.empty() ? 0 : 1;	// VOC-DEATH-3b: nothing left to hand back for
++		// VOC-DEATH-3b: m_jitIrqCheck is NOT cleared here. Measured: clearing it when the last request is taken let
++		// [JOBLEN] jobs run past the fs period again (2-7 % > 2083 cycles, 30 s walk) - only the dispatcher's
++		// "nothing takeable" clears it.
+ 
+ 		execInterrupt(vba);
+ 	}
+-- 
+2.49.0.windows.1
+

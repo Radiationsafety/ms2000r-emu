@@ -105,6 +105,7 @@ private:
     int m_syxDiag = 0;
     int m_demoDiag = 0;   // DEMO-FMT-1 diag: MS2K_DEMOAT
     long m_stormN = -1; int m_stormPad = -1; bool m_stormDown = false; double m_stormWall = 0.0;   // PADSTORM diag
+    int m_bankStormPhase = 0; long m_bankStormN = -1; int m_bankStormPad = -1; bool m_bankStormDown = false; int m_bankStormBankUp = 0;   // BANKSTORM diag
     int m_ramDumps = 0;   // DEMO-FMT-1 diag: MS2K_RAMDUMPAT
     bool bootMachine();                      // once, on the first prepareToPlay
     bool startMachine();                     // the power-on itself (boot and reboot)

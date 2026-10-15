@@ -2,6 +2,7 @@
 #include <memory>
 #include "../core/ms2000_runner.h"
 #include "../core/headless_runner.h"
+#include "../core/rom_paths.h"
 #include "../core/crash_dump.h"
 #include "../core/lcd_screenshot.h"
 #include "../core/panel_mp.h"  // fw27.txt: Protocol formalization
@@ -522,7 +523,7 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void
 #endif
 static void ms2kFindHome() {
     namespace fs = std::filesystem;
-    auto ok = [](const fs::path& d) { std::error_code ec; return fs::exists(d / "flash.bin", ec) && (fs::exists(d / "full FW" / "boot-362.ms2000.bin", ec) || fs::exists(d / "full FW" / "boot-362.bin", ec)); };
+    auto ok = [](const fs::path& d) { return ms2k::hasRoms(d); };   // ROM-PATHS-1
     fs::path home;
     if (const char* e = std::getenv("MS2K_HOME"); e && *e && ok(fs::path(e))) home = e;
     else if (ok(fs::current_path())) return;
@@ -537,7 +538,11 @@ static void ms2kFindHome() {
             }
     }
 #endif
-    if (home.empty()) return;
+    if (home.empty()) {   // ROM-PATHS-1: say what is missing where, instead of failing later without a word
+        std::cout << "[HOME] no MS2000 folder found (MS2K_HOME, the current folder, the exe's folder and the ones above it). "
+                  << "Missing in " << fs::current_path().string() << ": " << ms2k::missingRoms(fs::current_path()) << std::endl;
+        return;
+    }
     std::error_code ec; fs::current_path(home, ec);
     std::cout << "[HOME] " << home.string() << std::endl;
 }

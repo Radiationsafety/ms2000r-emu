@@ -1,0 +1,90 @@
+From 6cdf087519b847f7c887998a45142afd98a03539 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Wed, 14 Oct 2026 22:43:55 +0200
+Subject: [PATCH 21/24] VOC-DEATH-3: diagnostics for the program-ID liveness
+ check (all default OFF)
+
+The H8 firmware checks the DSP after each program change: 0x013B68-74 ->
+JSR 0x010DF4 -> 0x010C8E sends D01064 and reads 3 bytes into FFF7F4,
+compared with @0x24578 = 7D02C700. A mismatch resets and reloads the DSP
+(0x0106F4, P35 PORT_RESET). That reset path is what precedes the sound death.
+
+New instruments (measurement only):
+- [PORTRESET] H8 PC + stack + reply@FFF7F4 when PORT_RESET goes low
+- MS2K_D0LAT=1: reply window of each D01064 in MCU/DSP cycles (HRX read,
+  HTX write, latch, SS edges); needs the SHI read/write cycle counters
+  (dsp56300 shi.h/.cpp, diagnostic only)
+- MS2K_ISRBUSY=1: per 10 ms, fs edges at which the per-sample job
+  (P:$3B4 BSET #5,X:$FFFFC9 .. P:$454 BCLR) is still running
+- MS2K_D0FAIL=<s> / MS2K_D0FORCE=1: FAULT INJECTION for A/B only
+- BANKSTORM mode 5 + MS2K_BANKSEQ: explicit pad sequence (0 = no press)
+
+Measured (HostTest 48 kHz/512, 700 ms ping-pong walk, notes every 0.5 s,
+KNOBSKEEP, nvram hash C3044548B968580A unchanged before/after):
+- all 4 resets come from 0x013B7A with reply 00000000 (11.795, 18.801,
+  24.437, 26.665 s); window ~450 MCU / ~4500 DSP cycles; failing cases:
+  the DSP does not read HRX inside the window (held note + vocoder load)
+- job still running at the next fs edge: Single 37-38 %, vocoder 56-67 %;
+  main loop share 20 % -> 5 %
+- baseline: TX exact zero 14.5-28.5 s; D0FORCE: 0 resets, sound at 21.0 s
+  (0.0040) and 26.5 s (0.0059); DSPSPEED 1.03: 3 resets, death 25.5-28.0;
+  DSPSPEED 1.05 and 1.10: 0 resets, 0 stale replies, sound as D0FORCE
+- single forced reset (D0FAIL) in slow walks: sound returns after reload
+- FM rev.5 Table A-1 RENDERED A-2/A-5/A-6/A-7: JSR/JSET/JSSET/JSCLR/MOVE/
+  MOVEP/ANDI/ORI rows match opcodecycles.h
+
+Open: where the missing 3-5 % DSP throughput is lost (dynamic cycle
+profile of the job vs FM Table A-1..A-3 and pipeline interlocks).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hob75q4ASH4mPmALoirbn6
+---
+ source/dsp56kEmu/shi.cpp | 2 ++
+ source/dsp56kEmu/shi.h   | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/source/dsp56kEmu/shi.cpp b/source/dsp56kEmu/shi.cpp
+index d8947c3d..7971d2d7 100644
+--- a/source/dsp56kEmu/shi.cpp
++++ b/source/dsp56kEmu/shi.cpp
+@@ -77,6 +77,7 @@ namespace dsp56k
+ 					++m_hrxEmpty;
+ 					return 0;
+ 				}
++				m_hrxReadCycle = m_periph.getDSP().getCycles();
+ 				++m_hrxReads;	// reading an empty FIFO returns undefined data, zero is as good as anything
+ 
+ 				const auto res = m_rx[0];
+@@ -135,6 +136,7 @@ namespace dsp56k
+ 			// "Writing to the HTX register by DSP core instructions or by DMA transfers clears the
+ 			// HTDE flag", and doing so retires a pending underrun
+ 			m_htx = _val;
++			m_htxWriteCycle = m_periph.getDSP().getCycles();
+ 			m_hcsr &= ~static_cast<TWord>((1 << HCSR_HTDE) | (1 << HCSR_HTUE));
+ 			return;
+ 		default:
+diff --git a/source/dsp56kEmu/shi.h b/source/dsp56kEmu/shi.h
+index c2f63254..e0c5e40a 100644
+--- a/source/dsp56kEmu/shi.h
++++ b/source/dsp56kEmu/shi.h
+@@ -98,6 +98,9 @@ namespace dsp56k
+ 		uint64_t hrxEmptyReads() const				{ return m_hrxEmpty; }
+ 		uint32_t rxMaxFill() const					{ return m_rxMaxFill; }
+ 		uint32_t rxCount() const					{ return m_rxCount; }
++		// MS2000 VOC-DEATH-3 diagnostics: DSP cycle of the last HTX write and of the last HRX read
++		uint64_t htxWriteCycle() const				{ return m_htxWriteCycle; }
++		uint64_t hrxReadCycle() const				{ return m_hrxReadCycle; }
+ 
+ 		void setCallbackTx(CallbackTx&& _cb)		{ m_callbackTx = std::move(_cb); }
+ 
+@@ -118,6 +121,7 @@ namespace dsp56k
+ 		std::array<TWord, FifoSizeLarge> m_rx{};
+ 		uint32_t m_rxCount = 0;
+ 		uint64_t m_hrxReads = 0, m_hrxEmpty = 0; uint32_t m_rxMaxFill = 0;
++		uint64_t m_htxWriteCycle = 0, m_hrxReadCycle = 0;
+ 
+ 		CallbackTx m_callbackTx;
+ 	};
+-- 
+2.49.0.windows.1
+

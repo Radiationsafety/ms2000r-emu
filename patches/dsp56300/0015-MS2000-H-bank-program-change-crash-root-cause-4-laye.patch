@@ -1,0 +1,346 @@
+From 6ff35e21a36de19a9c9abd27c9f7b42b3a920239 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Mon, 12 Oct 2026 23:11:10 +0200
+Subject: [PATCH 15/24] MS2000: H-bank program change crash - root cause +
+ 4-layer JIT hardening
+
+MEASURED ROOT CAUSE (one defect, three costumes):
+- H08->H09 program change in the H bank sends the DSP PC to 0x800010 (bit 23
+  set), outside the JIT-covered program window (mem.sizeP()). The JIT indexes
+  the block cache / funcs tables with the raw PC:
+  * ORIGINAL upstream code: funcCreate -> create(pc, true) -> exec(pc) nests
+    one C++ frame per first-time block; a first-time linear run nests ~4000
+    deep -> STACK OVERFLOW inside asmjit (measured depth 3951, VEH frame
+    chain funcCreate->create->emit->optimize->constantFolding->areFlagsLive).
+    This kills the host (VSTHost/DAW crash on H10-H14 vocoder program change).
+  * Nesting removed but block never run: dispatcher spins re-calling the
+    create thunk -> 26 GB commit growth -> Windows Event 1003 resource
+    exhaustion -> the whole machine freezes (measured twice, 06:29 and 10:05).
+  * With bounded retry: std::bad_alloc thrown through noexcept funcCreate ->
+    std::terminate -> abort() 0xC0000409 (measured, named via try/catch
+    instrumentation on stderr: "[JIT-EXC] funcCreate std::exception at pc
+    0x800010: bad allocation").
+
+FIX (all four dispatch/compile choke points bounds-checked against
+memory().sizeP(); an out-of-window PC never indexes any table again):
+1. jittrampoline.cpp: the generated execUntilCycles loop cmp pc,sizeP /
+   jae exit before loading the entries pointer - never OOB-read a function
+   pointer (the old code could call garbage from past the table).
+2. jit.cpp funcCreate: window check, rate-limited stderr log, return.
+3. jit.cpp funcRecreate: same.
+4. dsp.h execOneEnsureRun: same before touching m_jitEntries.
+
+NESTING FIX (upstream-able, CPU flat, HW semantics kept):
+- create() no longer execs from inside funcCreate/funcRecreate: one C++ frame
+  per first-time block is gone; the dispatch loop picks the fresh block up.
+- execOneEnsureRun (dsp.cpp execInterrupt + dsp.h execJit): one-shot callers
+  re-read the entry after a create-thunk call and run the fresh block on a
+  flat stack, bounded 16 retries - an ISR is never silently skipped.
+- makeRoomForFirstInstruction failure path now logs (rate-limited) instead
+  of returning silently.
+
+VERIFIED (headless bankstorm, warden-guarded):
+- build green; boot passes (status t=2.52 s, pads at t=6.002/6.502, H08
+  program change completes: H01:Poly400 -> H08:Pulse Comp).
+- no STACK OVERFLOW, no std::terminate, no bad_alloc until the (pre-existing,
+  upstream) JIT memory appetite crosses the warden ceiling - the watchdog
+  kills the process and the machine stays healthy. NOTE: the 4+ GB growth
+  during boot/storm is a separate, pre-existing upstream defect (Event 1003
+  fired during the ORIGINAL code too, 06:29:46) - next hunt.
+---
+ source/dsp56kEmu/dsp.cpp           |  4 +-
+ source/dsp56kEmu/dsp.h             | 52 ++++++++++++++++++++--
+ source/dsp56kEmu/jit.cpp           | 71 +++++++++++++++++++++++++++++-
+ source/dsp56kEmu/jitblockchain.cpp | 31 ++++++++++++-
+ source/dsp56kEmu/jittrampoline.cpp | 12 ++++-
+ 5 files changed, 161 insertions(+), 9 deletions(-)
+
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 1e122c36..3f1b3ab0 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -223,7 +223,9 @@ namespace dsp56k
+ 		{
+ 			LOGJITPC(vba);
+ 			const auto pc = getPC();
+-			m_jit.getTrampoline().execOne(&reg, vba, m_jitEntries[vba]);
++			// 2026-10-12: one-shot ISR entry; with the nesting fix funcCreate compiles but does not run,
++			// so re-read the entry and run the fresh block (see execOneEnsureRun in dsp.h)
++			execOneEnsureRun(vba);
+ 			if(m_processingMode != LongInterrupt)
+ 			{
+ 				m_processingMode = DefaultPreventInterrupt;
+diff --git a/source/dsp56kEmu/dsp.h b/source/dsp56kEmu/dsp.h
+index 3a14b9d8..ec3a21d3 100644
+--- a/source/dsp56kEmu/dsp.h
++++ b/source/dsp56kEmu/dsp.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <cstdio>
+ 
+ #include "disasm.h"
+ #include "dspconfig.h"
+@@ -247,9 +248,54 @@ namespace dsp56k
+ 
+ 			const auto pc = getPC().toWord();
+ 			LOGJITPC(pc);
+-			// must go through the trampoline: it establishes regDspPtr, which blocks no longer set up
+-			// themselves. A direct call here leaves regDspPtr at whatever the caller happened to have.
+-			m_jit.getTrampoline().execOne(&reg, pc, m_jitEntries[pc]);
++			execOneEnsureRun(pc);
++		}
++
++		// 2026-10-12 MS2000 H-bank vocoder crash hunt: one-shot JIT entry call. When the entry at _pc
++		// is a create/recreate thunk, calling it compiles the block but - with the nesting fix in
++		// jitblockchain.cpp - does NOT run it from inside create(). One-shot callers (execInterrupt,
++		// execJit) would then silently skip the ISR/block, emulated time freezes and the outer
++		// execUntilCycles loop spins forever (measured: deterministic freeze at t~2.5 s, 26 GB commit).
++		// Re-read the entry after the call: if it changed (a fresh block was compiled), run the new
++		// entry on a flat stack. Bounded so a self-invalidating storm cannot spin here forever.
++		ASMJIT_FORCE_INLINE void execOneEnsureRun(const TWord _pc) noexcept
++		{
++			// 2026-10-12: a pc outside the JIT-covered program window must never index m_jitEntries
++			// (measured: pc 0x800010 during the H-bank program change reads a func pointer past the
++			// table and calls garbage). Same condition as in the trampoline loop and the create thunks.
++			if (_pc >= memory().sizeP())
++			{
++				static thread_local int s_oobExec = 0;
++				if ((++s_oobExec & 1023) == 1)
++					std::fprintf(stderr, "[JIT] execOneEnsureRun: pc 0x%06X outside the compiled program window (0x%X) - not dispatching\n",
++						_pc, memory().sizeP());
++				return;
++			}
++
++			auto f = m_jitEntries[_pc];
++			for (int retry = 0; retry < 16; ++retry)
++			{
++				// must go through the trampoline: it establishes regDspPtr, which blocks no longer set up
++				// themselves. A direct call here leaves regDspPtr at whatever the caller happened to have.
++				try
++				{
++					m_jit.getTrampoline().execOne(&reg, _pc, f);
++				}
++				catch (const std::exception& e)
++				{
++					std::fprintf(stderr, "[JIT-EXC] execOneEnsureRun std::exception at pc 0x%06X: %s\n", _pc, e.what());
++					throw;
++				}
++				catch (...)
++				{
++					std::fprintf(stderr, "[JIT-EXC] execOneEnsureRun unknown exception at pc 0x%06X\n", _pc);
++					throw;
++				}
++				const auto fNext = m_jitEntries[_pc];
++				if (fNext == f || fNext == nullptr)
++					return;
++				f = fNext;
++			}
+ 		}
+ 
+ 		ASMJIT_FORCE_INLINE void execInterpreter() noexcept
+diff --git a/source/dsp56kEmu/jit.cpp b/source/dsp56kEmu/jit.cpp
+index e356bfca..ca15cc7e 100644
+--- a/source/dsp56kEmu/jit.cpp
++++ b/source/dsp56kEmu/jit.cpp
+@@ -85,14 +85,81 @@ namespace dsp56k
+ #endif
+ 	constexpr bool g_traceOps = false;
+ 
++	// 2026-10-12 MS2000 H-bank vocoder crash hunt: true while funcCreate/funcRecreate (called from JIT'd
++	// code) is on the stack. create() checks it to NOT exec the freshly compiled block from inside its
++	// own C++ frame - the caller block's ret unwinds to the dispatch loop on a flat stack instead.
++	// The old exec-from-create nested one C++ frame per block; a first-time run of the H-bank vocoder
++	// program change reached depth 3951 and overflowed the stack, killing the host.
++	thread_local bool g_inFuncCreate = false;
++	struct SetInFuncCreate { ~SetInFuncCreate(){ g_inFuncCreate = false; } SetInFuncCreate(){ g_inFuncCreate = true; } };
++
+ 	void funcCreate(JitDspPtr* _jit, const TWord _pc) noexcept
+ 	{
+-		Jit::toJitPtr(_jit)->create(_pc, true);
++		auto* const jit = Jit::toJitPtr(_jit);
++
++		// 2026-10-12: a pc outside the JIT-covered program window must never index the block caches
++		// (measured: pc 0x800010 during the H-bank program change -> bad_alloc / 26 GB commit /
++		// std::terminate kills the host). The dispatch loop exits on the same condition; the machine
++		// visibly stops instead of taking the process down.
++		if (_pc >= jit->dsp().memory().sizeP())
++		{
++			static thread_local int s_oobCreate = 0;
++			if ((++s_oobCreate & 1023) == 1)
++				std::fprintf(stderr, "[JIT] funcCreate: pc 0x%06X outside the compiled program window (0x%X) - not compiling\n",
++					_pc, jit->dsp().memory().sizeP());
++			return;
++		}
++
++		const SetInFuncCreate guard;
++		try
++		{
++			Jit::toJitPtr(_jit)->create(_pc, true);
++		}
++		catch (const std::exception& e)
++		{
++			// 2026-10-12: an exception escaping this noexcept function is std::terminate (measured at the
++			// H08 program change). Name it on stderr - stderr is unbuffered, it survives the abort.
++			std::fprintf(stderr, "[JIT-EXC] funcCreate std::exception at pc 0x%06X: %s\n", _pc, e.what());
++			throw;
++		}
++		catch (...)
++		{
++			std::fprintf(stderr, "[JIT-EXC] funcCreate unknown exception at pc 0x%06X\n", _pc);
++			throw;
++		}
+ 	}
+ 
+ 	void funcRecreate(JitDspPtr* _jit, const TWord _pc) noexcept
+ 	{
+-		Jit::toJitPtr(_jit)->recreate(_pc);
++		auto* const jit = Jit::toJitPtr(_jit);
++
++		// 2026-10-12: same window check as funcCreate - never index the caches with an out-of-window pc
++		if (_pc >= jit->dsp().memory().sizeP())
++		{
++			static thread_local int s_oobRecreate = 0;
++			if ((++s_oobRecreate & 1023) == 1)
++				std::fprintf(stderr, "[JIT] funcRecreate: pc 0x%06X outside the compiled program window (0x%X) - not recreating\n",
++					_pc, jit->dsp().memory().sizeP());
++			return;
++		}
++
++		// 2026-10-12: same as funcCreate - do not run the recreated block from inside the C++ frame
++		// (see funcCreate above); return and let the dispatch loop pick it up flat.
++		const SetInFuncCreate guard;
++		try
++		{
++			Jit::toJitPtr(_jit)->recreate(_pc);
++		}
++		catch (const std::exception& e)
++		{
++			std::fprintf(stderr, "[JIT-EXC] funcRecreate std::exception at pc 0x%06X: %s\n", _pc, e.what());
++			throw;
++		}
++		catch (...)
++		{
++			std::fprintf(stderr, "[JIT-EXC] funcRecreate unknown exception at pc 0x%06X\n", _pc);
++			throw;
++		}
+ 	}
+ 
+ 	void funcRunCheckPMemWrite(JitDspPtr* _jit, const TWord _pc) noexcept
+diff --git a/source/dsp56kEmu/jitblockchain.cpp b/source/dsp56kEmu/jitblockchain.cpp
+index 9054d7b2..cde0e640 100644
+--- a/source/dsp56kEmu/jitblockchain.cpp
++++ b/source/dsp56kEmu/jitblockchain.cpp
+@@ -1,5 +1,7 @@
+ #include "jitblockchain.h"
+ 
++#include <atomic>
++
+ #include "dsp.h"
+ #include "jitasmjithelpers.h"
+ #include "jitblockruntimedata.h"
+@@ -17,6 +19,12 @@ namespace dsp56k
+ 	void funcCreate(JitDspPtr* _jit, TWord _pc) noexcept;
+ 	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;
+ 
++	// 2026-10-12 MS2000 H-bank vocoder crash hunt: nesting depth of JitBlockChain::create (each first-time
++	// block execs from inside create(), so a first-time linear run nests one C++ frame per block).
++	std::atomic<int> g_jitCreateDepth{ 0 };
++	// defined in jit.cpp: true while funcCreate/funcRecreate (called from JIT'd code) is on the stack
++	extern thread_local bool g_inFuncCreate;
++
+ 	JitBlockChain::JitBlockChain(Jit& _jit, const JitDspMode& _mode, const size_t _usedFuncSize) : m_jit(_jit), m_mode(_mode)
+ 	{
+ 		m_logger.reset(new AsmJitLogger());
+@@ -121,6 +129,18 @@ namespace dsp56k
+ 
+ 	void JitBlockChain::create(const TWord _pc, bool _execute)
+ 	{
++	// 2026-10-12 MS2000 H-bank vocoder crash hunt (STACK OVERFLOW): every first-time block runs from
++	// inside create() via exec() - each new block nests one C++ frame deeper. A long linear section
++	// of first-time code (a program change loading a big vocoder program) nests thousands of frames
++	// and kills the stack. Count the nesting, expose it to the crash handler.
++	static thread_local int s_createDepth = 0;
++	++s_createDepth;
++	struct DepthGuard { int* d; ~DepthGuard(){ --*d; } } dg{ &s_createDepth };
++	g_jitCreateDepth.store(s_createDepth, std::memory_order_relaxed);
++	// when called from JIT'd code (funcCreate), do NOT exec from here: the caller block's ret returns
++	// to the trampoline on a flat stack, and the next execOne picks up the freshly compiled block
++	const bool runFromHere = _execute && !g_inFuncCreate;
++
+ //		LOG("Create @ " << HEX(_pc));// << std::endl << cacheEntry.block->getDisasm());
+ 
+ 		ensureCacheSize(_pc+1);
+@@ -129,6 +149,13 @@ namespace dsp56k
+ 		{
+ 			// only a block that is being generated can be in the way, and no code runs while blocks are being generated
+ 			assert(!_execute);
++			// 2026-10-12: reaching this from JIT'd code is a livelock candidate (the dispatch loop would
++			// re-call funcCreate forever without progress). It should be impossible now that create no
++			// longer executes blocks while generating - if this log ever fires, that assumption is wrong.
++			static thread_local int s_makeRoomFails = 0;
++			if ((++s_makeRoomFails & 1023) == 1)
++				LOG("JitBlockChain::create: makeRoomForFirstInstruction FAILED at pc " << HEX(_pc)
++					<< " depth " << s_createDepth << " (block being generated is in the way)");
+ 			return;
+ 		}
+ 
+@@ -167,7 +194,7 @@ namespace dsp56k
+ 
+ 					occupyArea(cacheEntry.block);
+ 
+-					if(_execute)
++					if(runFromHere)
+ 						exec(_pc);
+ 					return;
+ 				}
+@@ -175,7 +202,7 @@ namespace dsp56k
+ 		}
+ 
+ 		emit(_pc);
+-		if(_execute)
++		if(runFromHere)
+ 			exec(_pc);
+ 	}
+ 
+diff --git a/source/dsp56kEmu/jittrampoline.cpp b/source/dsp56kEmu/jittrampoline.cpp
+index 31e9ab3f..b9540b6d 100644
+--- a/source/dsp56kEmu/jittrampoline.cpp
++++ b/source/dsp56kEmu/jittrampoline.cpp
+@@ -320,6 +320,8 @@ namespace dsp56k
+ 		m_asm.mov(asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotClockPtr, 8), asmjit::x86::rax);
+ 
+ 		const auto label = m_asm.newNamedLabel("beginExecUntilCycles");
++		// 2026-10-12 MS2000 H-bank crash hunt: the loop-exit label for out-of-window PCs
++		const auto lExitPc = m_asm.newLabel();
+ 		m_asm.align(asmjit::AlignMode::kCode, 64);
+ 		m_asm.bind(label);
+ 
+@@ -347,7 +349,14 @@ namespace dsp56k
+ 		// 2) the block at the current PC: (DspRegs*, PC)
+ 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
+ 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
+-		m_asm.mov(g_funcToCall, Jitmem::makePtr(g_funcToCall, g_funcArgGPs[1], 3, 8));
++		// 2026-10-12 MS2000 H-bank crash hunt: never dispatch a pc outside the JIT-covered program
++		// window. m_jitEntries is sized memory().sizeP(); an out-of-window pc (measured 0x800010
++		// during the H-bank program change) reads a function pointer past the table and calls
++		// garbage, and the create thunk would index the block caches with it (measured: bad_alloc,
++		// 26 GB commit growth, std::terminate - the host dies). Exit the loop instead.
++		m_asm.cmp(r32(g_funcArgGPs[1]), asmjit::Imm(static_cast<uint32_t>(m_dsp.memory().sizeP())));
++		m_asm.jae(lExitPc);
++		m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3, 8));
+ 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
+ 		m_asm.call(g_funcToCall);
+ 
+@@ -357,6 +366,7 @@ namespace dsp56k
+ 		m_asm.cmp(Jitmem::makeRelativePtr(&m_dsp.getCycles(), &m_dsp, dsp, 8), scratchA);
+ 		m_asm.jb(label);
+ 
++		m_asm.bind(lExitPc);
+ 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_additionalStackSize));
+ 		for (size_t i=std::size(g_trampolineSavedGPs); i-- > 0;)
+ 			m_asm.pop(r64(g_trampolineSavedGPs[i]));
+-- 
+2.49.0.windows.1
+

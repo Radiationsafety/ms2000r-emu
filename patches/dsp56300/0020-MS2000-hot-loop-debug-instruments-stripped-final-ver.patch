@@ -1,0 +1,97 @@
+From f06b674e5a61d2b15a1114f13869aa813fb22973 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Wed, 14 Oct 2026 00:16:12 +0200
+Subject: [PATCH 20/24] MS2000: hot-loop debug instruments stripped; final
+ verification all green
+
+Removed from the generated execUntilCycles dispatch loop (per-iteration costs):
+- the g_dbgAsmBase/g_dbgAsmIndex bake stores (2 globals written per dispatch)
+- the funcRecreate-compare trace thunk (cmp + branch per dispatch)
+The dispatch keeps THE fix: ptr(base, index, 3) - no displacement.
+
+FINAL VERIFICATION (bankstorm 30 s, warden 4096 MB, MS2K_BANKSTORM=5,500,150,1,2):
+- [warden] child exit code = 0 - clean exit, no terminate, no memory kill
+- 30 t= heartbeat lines, full 30 emulated seconds
+- recreates=15 total (legitimate mid-block entries at the bootloader re-entry),
+  funcRecreate storm completely gone (was: 2.4 billion/run)
+- WAV: 7.9 MB, 30.0 s, 24-bit stereo, real signal at the first program change
+  (t=3-6 s RMS 0.055/0.057, peak 0.614); midi out events 97
+- ~2x real-time (30 s emulated in 15.25 s wall)
+
+Remaining, next: during the hole-walks the pending SHI IRQ never gets serviced
+(measured: interruptFunc = dspExecInterrupts for the whole 8M-word walk - the
+priority machinery keeps masking it), 127K RX bytes drop and the second uploaded
+program corrupts (silence after t=9 s). The walk's true silicon shape (illegal-
+instruction exception? H8S-driven DSP reset? NMI?) needs the real machine's
+behaviour - hardware question.
+---
+ source/dsp56kEmu/jittrampoline.cpp | 44 +++---------------------------
+ 1 file changed, 4 insertions(+), 40 deletions(-)
+
+diff --git a/source/dsp56kEmu/jittrampoline.cpp b/source/dsp56kEmu/jittrampoline.cpp
+index 4a7bc6a6..9445335d 100644
+--- a/source/dsp56kEmu/jittrampoline.cpp
++++ b/source/dsp56kEmu/jittrampoline.cpp
+@@ -358,16 +358,6 @@ namespace dsp56k
+ 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
+ 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
+ 
+-		// 2026-10-13 hunt: bake the base and index the ASM is about to use into globals, so the
+-		// trace thunk can print the exact cell address the dispatch reads - the C++ read of the
+-		// same logical cell stably returns a different value, so the addressing must differ.
+-		{
+-			m_asm.mov(asmjit::x86::r11, asmjit::Imm(reinterpret_cast<uint64_t>(&g_dbgAsmBase)));
+-			m_asm.mov(asmjit::x86::ptr(asmjit::x86::r11, 0, 8), r64(g_funcToCall));
+-			m_asm.mov(asmjit::x86::r11, asmjit::Imm(reinterpret_cast<uint64_t>(&g_dbgAsmIndex)));
+-			m_asm.mov(asmjit::x86::ptr(asmjit::x86::r11, 0, 8), r64(g_funcArgGPs[1]));
+-		}
+-
+ 		// 2026-10-12 MS2000 H-bank crash hunt: never dispatch a pc outside the JIT-covered program
+ 		// window. m_jitEntries is sized memory().sizeP(); an out-of-window pc (measured 0x800010
+ 		// during the H-bank program change) reads a function pointer past the table and calls
+@@ -379,38 +369,12 @@ namespace dsp56k
+ 		// model is configured, this could be a tiny window and the bootstrap at 0xFF0000 would exit
+ 		std::fprintf(stderr, "[JIT-TRAMP] execUntilCycles dispatch window baked = 0x%zX\n",
+ 			static_cast<size_t>(m_dsp.memory().sizeP()));
+-		// 2026-10-13 THE FIX: the original dispatch load was
+-		//     ptr(base, index, 3, 8) - asmjit's 4th mem operand argument is the DISPLACEMENT,
+-		// not the access size. The generated code read [entries + pc*8 + 8] = entries[pc+1]:
+-		// for every pc inside a multi-word block that is the block's own interior mark
+-		// (&funcRecreate). The bootstrap dispatch at P:0xFF0000 loaded its own block's interior
+-		// mark and re-created itself ~billions of times per run (the whole recreate storm,
+-		// the 4+ GB leak and the boot livelock all came from this one displacement).
++		// 2026-10-13: THE recreate-storm fix is in (no displacement). The funcRecreate-compare
++		// trace thunk (cmp + branch in this hot loop) is removed - it identified the storm and
++		// is no longer needed; see the funcRecreate-body diagnostics for recreate accounting.
+ 		m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3));
+ 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
+-
+-		// 2026-10-12 recreate-pingpong hunt: when the loaded target is funcRecreate, call the trace
+-		// thunk instead, passing the exact loaded pointer - it prints loaded vs slot-now before
+-		// performing the original call.
+-		// 2026-10-13 FIX 1: cmp r64, imm64 does not exist on x86 - materialize into a register.
+-		// 2026-10-13 FIX 2: g_funcToCall aliases g_funcArgGPs[2] (both r8) - the previous arg setup
+-		// clobbered the value. Compare via scratchA/scratchB and pass the value honestly; the
+-		// trace call goes through rax, which the loop reloads right after anyway.
+-		{
+-			const auto lNormalCall = m_asm.newLabel();
+-			const auto lAfterCall = m_asm.newLabel();
+-			m_asm.mov(scratchA, r64(g_funcToCall));						// r10 = the loaded value
+-			m_asm.mov(scratchB, asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreate)));
+-			m_asm.cmp(r64(scratchA), r64(scratchB));					// cmp r10, r11
+-			m_asm.jne(lNormalCall);
+-			m_asm.mov(r64(g_funcArgGPs[2]), r64(scratchA));			// r8 = the loaded value (arg2)
+-			m_asm.mov(asmjit::x86::rax, asmjit::Imm(reinterpret_cast<uint64_t>(&dsp56k::funcRecreateTrace)));
+-			m_asm.call(asmjit::x86::rax);
+-			m_asm.jmp(lAfterCall);
+-			m_asm.bind(lNormalCall);
+-			m_asm.call(r64(g_funcToCall));
+-			m_asm.bind(lAfterCall);
+-		}
++		m_asm.call(r64(g_funcToCall));
+ 
+ 		// 3) again while cycles < target
+ 		m_asm.mov(dsp, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotDsp, 8));
+-- 
+2.49.0.windows.1
+

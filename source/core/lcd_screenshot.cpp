@@ -21,7 +21,8 @@ static void initFontData() {
     // Attempt to load standard Hitachi HD44780 A00 CGROM binary (4096 bytes)
     const char* paths[] = {
         "hd44780_a00.bin",
-        "C:\\workspace\\MS2000\\hd44780_a00.bin",
+        "full FW/hd44780_a00.bin",   // ROM-PATHS-1
+        "Full FW/hd44780_a00.bin",
         "..\\hd44780_a00.bin",
         "..\\..\\hd44780_a00.bin"
     };

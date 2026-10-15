@@ -48,7 +48,7 @@ namespace dsp56k
 		return length + opcodes.getOpcodeLength(repA);
 	}
 
-	void JitBlock::getInfo(JitBlockInfo& _info, const DSP& _dsp, const TWord _pc, const JitConfig& _config, const MmuArray<JitCacheEntry>& _cache, const std::set<TWord>& _volatileP, const std::map<TWord, TWord>& _loopStarts, const std::set<TWord>& _loopEnds, std::vector<TWord>* _opCycles/* = nullptr*/)
+	void JitBlock::getInfo(JitBlockInfo& _info, const DSP& _dsp, const TWord _pc, const JitConfig& _config, const MmuArray<JitCacheEntry>& _cache, const std::set<TWord>& _volatileP, const std::map<TWord, TWord>& _loopStarts, const std::set<TWord>& _loopEnds, std::vector<TWord>* _opCycles/* = nullptr*/, const std::set<TWord>* _forcedSplits/* = nullptr*/)
 	{
 		const auto& opcodes = _dsp.opcodes();
 
@@ -163,6 +163,20 @@ namespace dsp56k
 			if(isExistingCode(pc, pc + getInstructionLength(_dsp, pc)))
 			{
 				assert(numInstructions && "JitBlockChain::create makes room for the first instruction of a block");
+				terminationReason = JitBlockInfo::TerminationReason::ExistingCode;
+				break;
+			}
+
+			/*
+				2026-10-12 MS2000 recreate-pingpong fix: a hot mid-block entry pc (Jit::markRecreateEntry,
+				threshold 16). End any block here EVEN IF no block currently occupies this pc: the
+				boot-ROM entry at P:0xFF0000 and a covering block from below otherwise destroy and
+				re-create each other forever, each blind to the other because the planner sees the
+				other block dead at every planning moment (measured: ~75k destroy+re-emit/s, the asmjit
+				pool never shrinks -> 4+ GB commit -> the host dies).
+			*/
+			if(numInstructions && _forcedSplits && _forcedSplits->find(pc) != _forcedSplits->end())
+			{
 				terminationReason = JitBlockInfo::TerminationReason::ExistingCode;
 				break;
 			}
@@ -445,7 +459,8 @@ namespace dsp56k
 
 		uint32_t blockFlags = 0;
 
-		getInfo(info, dsp(), _pc, m_config, _cache, _volatileP, _loopStarts, _loopEnds, &m_opCycles);
+		getInfo(info, dsp(), _pc, m_config, _cache, _volatileP, _loopStarts, _loopEnds, &m_opCycles,
+			_chain ? &_chain->getForcedSplits() : nullptr);
 
 		const auto pcNext = _pc + info.memSize;
 
@@ -939,7 +954,9 @@ namespace dsp56k
 
 		const auto pcWritten = m_dspRegPool.isWritten(PoolReg::DspPC);
 
-		if(pcWritten && childrenEstablishPc)
+		// VOC-DEATH-3b: with linkCheckInterrupts a linked exit may return instead; a conditional child's PC must then be
+		// in memory (the other exits store childAddr themselves before returning)
+		if(pcWritten && childrenEstablishPc && !(m_config.linkCheckInterrupts && child && childIsConditional))
 			m_dspRegPool.discardWritten(PoolReg::DspPC);
 
 		_rt.setEstablishesPc(pcWritten || childrenEstablishPc);
@@ -955,6 +972,33 @@ namespace dsp56k
 		m_stack.reset();
 
 		profileEnd(pl);
+
+#ifndef HAVE_ARM64
+		/*	MS2000 VOC-DEATH-3b: a linked chain never passes the dispatcher, where pending interrupts are taken. With
+			linkCheckInterrupts every linked exit first tests DSP::m_jitIrqCheck (set by injectInterrupt, cleared when the
+			dispatcher finds nothing takeable) and returns to the dispatcher while it is set. The PC the child would
+			have started at is stored first: childAddr for an unconditional or fall-through child; for a conditional
+			child the block's own PC write already reached memory (its discard is disabled above).
+		*/
+		if(m_config.linkCheckInterrupts && (child || nonBranchChild))
+		{
+			// a temp that is not regPC (still needed for the conditional child compare below)
+			auto t = r64(g_funcArgGPs[1]);
+			if(regPC.isValid() && r64(regPC) == t)
+				t = r64(g_funcArgGPs[2]);
+			const auto noIrq = m_asm.newLabel();
+			m_asm.mov(t, asmjit::Imm(reinterpret_cast<uint64_t>(&m_dsp.m_jitIrqCheck)));
+			m_asm.cmp(asmjit::x86::dword_ptr(t), asmjit::Imm(0));
+			m_asm.jz(noIrq);
+			if(!(child && childIsConditional))
+			{
+				m_asm.mov(t, asmjit::Imm(reinterpret_cast<uint64_t>(&m_dsp.regs().pc.var)));
+				m_asm.mov(asmjit::x86::dword_ptr(t), asmjit::Imm(childAddr));
+			}
+			m_asm.ret();
+			m_asm.bind(noIrq);
+		}
+#endif
 
 		asmjit::Label lj;
 

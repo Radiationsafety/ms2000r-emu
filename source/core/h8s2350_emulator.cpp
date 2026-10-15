@@ -1087,7 +1087,7 @@ static bool ms2kAnyEnv(std::initializer_list<const char*> names)
     return false;
 }
 // the per-instruction probes in executeInstruction (SPTRACE, RAMWATCH, PCTRACE, EPROBE, REGWATCH, LOOPWATCH)
-static const bool g_ms2kInsnDiag = ms2kAnyEnv({ "MS2K_SPTRACE", "MS2K_RAMWATCH", "MS2K_PCTRACE", "MS2K_EPROBE",
+static const bool g_ms2kInsnDiag = ms2kAnyEnv({ "MS2K_SPTRACE", "MS2K_RAMWATCH", "MS2K_PCTRACE", "MS2K_PCCYC", "MS2K_EPROBE",
                                                 "MS2K_REGWATCH", "MS2K_LOOPWATCH" });
 // the register-file ring dumped by PC-OFFMAP / ODD-PC / VEC-HALT / LOOPWATCH (8 registers per instruction)
 static const bool g_ms2kPcRing = ms2kAnyEnv({ "MS2K_PCRING", "MS2K_LOOPWATCH" });
@@ -2965,7 +2965,8 @@ uint8_t H8S2350Emulator::readIORegisterStruct(uint32_t address)
                           | (m_io_registers.P6DR & m_io_registers.P6DDR));
             {
                 static uint32_t n = 0;
-                if (n < 24) { ++n;
+                static const uint32_t cap = [] { const char* e = std::getenv("MS2K_PORT6LOG"); return e ? uint32_t(std::atoi(e)) : 24u; }();
+                if (n < cap) { ++n;
                     printf("[PORT6] select=0x%X -> 0x%02X at PC=0x%06X\n",
                            sel, value, m_effectivePC);
                 }
@@ -4343,6 +4344,35 @@ void H8S2350Emulator::sci0SpiCharacterDone()
     const bool ss       = (m_io_registers.PFDR & 0x02) == 0;          // DSP_SS active low
     const uint8_t wire  = msbFirst ? m_sci0_tsr : bitrev8(m_sci0_tsr);
     if (m_dsp) m_dsp->syncMcu();   // PERF-131: the DSP runs up to the instruction before this one, as it did
+    // 2026-10-13 EMU RX-FLOW GATE (rationale + measurements in dsp56362_emulator.h): if the
+    // SHI RX FIFO is full at this character, STRETCH THE CHARACTER in the MCU's own clock
+    // (re-arm the TX busy time) instead of gifting the DSP extra cycles: the MCU pays for
+    // the wait exactly as a real master polling a not-ready slave would, and the DSP gets
+    // the same window through the normal per-timeslice posting - one shared timeline, no
+    // desync (the first shape of this gate posted extra DSP cycles and the DSP timeline ran
+    // 10x ahead: 315 t-lines in a 30 s run, measured). Up to 8 re-arms x ~256 MCU cycles;
+    // if the DSP still cannot drain, the byte lands anyway (the old overrun path, safety
+    // valve).
+    // MS2K_RXGATE=0 (A/B, measurement only): the gate off, the old overrun path - to measure the root cause
+    static const bool s_rxGateOff = [] { const char* e = std::getenv("MS2K_RXGATE"); return e && *e == '0'; }();
+    if (m_dsp && !s_rxGateOff) {
+        if (m_dsp->shiRxFull()) {
+            static unsigned long long s_gateHolds = 0, s_gateValves = 0;   // measurement: how often the gate acts
+            if (m_sci0_gate_rearms >= 8 && ++s_gateValves <= 8)
+                printf("[RXGATE] safety valve #%llu at MCU cycle %llu\n", s_gateValves, (unsigned long long)getCycles());
+            if (m_sci0_gate_rearms < 8 && (++s_gateHolds <= 8 || (s_gateHolds % 10000) == 0))
+                printf("[RXGATE] hold #%llu at MCU cycle %llu\n", s_gateHolds, (unsigned long long)getCycles());
+            if (m_sci0_gate_rearms < 8) {
+                ++m_sci0_gate_rearms;
+                m_sci0_tx_active      = true;
+                m_sci0_tx_busy_cycles = 256;
+                return;                     // the character is not done yet: the MCU waits
+            }
+            // safety valve: fall through, the byte lands (overrun counted as before)
+        } else {
+            m_sci0_gate_rearms = 0;
+        }
+    }
     const uint8_t miso  = m_dsp ? m_dsp->spiByte(wire, ss) : uint8_t(0xFF);   // no DSP: pull-up
     const uint8_t rdr   = msbFirst ? miso : bitrev8(miso);
     {   // MS2K_SPITRACE=N: the first N bytes on the wire, both directions.
@@ -4693,6 +4723,13 @@ void H8S2350Emulator::updatePortReset()
     const bool drive1 = out && (m_io_registers.P3DR & 0x20) && !(m_p3odr & 0x20);
     if (drive1 == m_portResetHigh) return;
     m_portResetHigh = drive1;
+    if (!drive1) {   // VOC-DEATH-3 diagnostic: who drives PORT_RESET low (H8 PC + 8 stack longwords)
+        static int s_told = 0;
+        if (s_told < 16) { ++s_told; const uint32_t sp = m_registers.er[7] & 0xFFFFFF;
+            printf("[PORTRESET] low by H8 PC=%06X (pc=%06X) SP=%06X stack:", m_last_exec.pc, m_registers.pc & 0xFFFFFF, sp);
+            for (int i = 0; i < 8; ++i) printf(" %08X", readLong(sp + 4u * i));
+            printf(" reply@FFF7F4=%08X t=%.6f\n", readLong(0xFFF7F4), double(m_cycles) / 10.0e6); }
+    }
     if (m_dsp) m_dsp->setPortReset(drive1);
 }
 
@@ -6656,6 +6693,16 @@ void H8S2350Emulator::executeInstruction()
         }
     }
 
+    // VOC-DEATH-3 (MS2K_PCCYC=<hex pc>[:N]): the MCU cycle count at each visit of that PC (first N, default 64),
+    // with the delta from the previous visit - instruction-state checks against the HM tables. R2 diagnostic.
+    {
+        static long pcc = -2; static unsigned pccN = 64, pccSeen = 0; static uint64_t pccLast = 0;
+        if (pcc == -2) { pcc = -1; if (const char* e = std::getenv("MS2K_PCCYC")) { pcc = long(std::strtoul(e, nullptr, 16));
+            if (const char* c = std::strchr(e, ':')) pccN = unsigned(std::atoi(c + 1)); } }
+        if (pcc >= 0 && pc0 == uint32_t(pcc) && pccSeen < pccN) { ++pccSeen;
+            printf("[PCCYC] %06X cycle %llu (+%llu)\n", unsigned(pcc), (unsigned long long)m_cycles, (unsigned long long)(m_cycles - pccLast));
+            pccLast = m_cycles; }
+    }
     // PC TRACE - see ms2kPcTraceFile(). R2 diagnostic, default OFF.
     if (FILE* tf = ms2kPcTraceFile()) {
         static uint64_t tn = 0;

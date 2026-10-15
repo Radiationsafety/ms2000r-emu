@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
+#include <intrin.h>
 
 #include "disasm.h"
 #include "dspconfig.h"
@@ -21,6 +23,9 @@
 
 namespace dsp56k
 {
+	// 2026-10-12 recreate-pingpong hunt: defined in jit.cpp, declared here for the dispatch
+	// instruments (dsp.h has no access to the jitblockchain internals).
+	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;
 	class Memory;
 	class InterpreterUnitTests;
 	class JitUnittests;
@@ -151,6 +156,10 @@ namespace dsp56k
 
 	private:
 		void execInterruptsByPriority();
+	public:
+		uint64_t m_intTaken[256] = {};	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector address
+		uint32_t m_jitIrqCheck = 0;		// MS2000 VOC-DEATH-3b: 1 = a request may be takeable, linked JIT jumps return to the dispatcher
+	private:
 		void onLongInterruptFormed(TWord _vba);
 
 		TInterruptPriorityFunc						m_interruptPriorityFunc;
@@ -247,9 +256,69 @@ namespace dsp56k
 
 			const auto pc = getPC().toWord();
 			LOGJITPC(pc);
-			// must go through the trampoline: it establishes regDspPtr, which blocks no longer set up
-			// themselves. A direct call here leaves regDspPtr at whatever the caller happened to have.
-			m_jit.getTrampoline().execOne(&reg, pc, m_jitEntries[pc]);
+			execOneEnsureRun(pc);
+		}
+
+		// 2026-10-12 MS2000 H-bank vocoder crash hunt: one-shot JIT entry call. When the entry at _pc
+		// is a create/recreate thunk, calling it compiles the block but - with the nesting fix in
+		// jitblockchain.cpp - does NOT run it from inside create(). One-shot callers (execInterrupt,
+		// execJit) would then silently skip the ISR/block, emulated time freezes and the outer
+		// execUntilCycles loop spins forever (measured: deterministic freeze at t~2.5 s, 26 GB commit).
+		// Re-read the entry after the call: if it changed (a fresh block was compiled), run the new
+		// entry on a flat stack. Bounded so a self-invalidating storm cannot spin here forever.
+		ASMJIT_FORCE_INLINE void execOneEnsureRun(const TWord _pc) noexcept
+		{
+			// 2026-10-12: a pc outside the JIT-covered program window must never index m_jitEntries
+			// (measured: pc 0x800010 during the H-bank program change reads a func pointer past the
+			// table and calls garbage). Same condition as in the trampoline loop and the create thunks.
+			if (_pc >= memory().sizeP())
+			{
+				static thread_local int s_oobExec = 0;
+				if ((++s_oobExec & 1023) == 1)
+					std::fprintf(stderr, "[JIT] execOneEnsureRun: pc 0x%06X outside the compiled program window (0x%X) - not dispatching\n",
+						_pc, memory().sizeP());
+				return;
+			}
+
+			auto f = m_jitEntries[_pc];
+
+			// 2026-10-12 recreate-pingpong hunt: if this C++ dispatch loads the recreate thunk while
+			// the chain table holds something else, we have the mismatch that feeds the 75k/s storm.
+			// The caller address names the entry path (execInterrupt vs execJit).
+			if (f == &funcRecreate)
+			{
+				static thread_local int s_pr = 0;
+				if (s_pr < 20)
+				{
+					++s_pr;
+					std::fprintf(stderr, "[TR] execOneEnsureRun RECREATE pc=0x%06X chainTable=%p caller=%p\n",
+						_pc, m_jit.debugCurrentChainEntry(_pc), _ReturnAddress());
+				}
+			}
+
+			for (int retry = 0; retry < 16; ++retry)
+			{
+				// must go through the trampoline: it establishes regDspPtr, which blocks no longer set up
+				// themselves. A direct call here leaves regDspPtr at whatever the caller happened to have.
+				try
+				{
+					m_jit.getTrampoline().execOne(&reg, _pc, f);
+				}
+				catch (const std::exception& e)
+				{
+					std::fprintf(stderr, "[JIT-EXC] execOneEnsureRun std::exception at pc 0x%06X: %s\n", _pc, e.what());
+					throw;
+				}
+				catch (...)
+				{
+					std::fprintf(stderr, "[JIT-EXC] execOneEnsureRun unknown exception at pc 0x%06X\n", _pc);
+					throw;
+				}
+				const auto fNext = m_jitEntries[_pc];
+				if (fNext == f || fNext == nullptr)
+					return;
+				f = fNext;
+			}
 		}
 
 		ASMJIT_FORCE_INLINE void execInterpreter() noexcept

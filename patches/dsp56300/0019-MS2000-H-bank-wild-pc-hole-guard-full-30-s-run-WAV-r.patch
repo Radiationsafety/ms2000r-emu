@@ -1,0 +1,69 @@
+From 5bbf33a2610145bfdaa7e0711f3614599fbc8766 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Wed, 14 Oct 2026 00:02:39 +0200
+Subject: [PATCH 19/24] MS2000: H-bank wild-pc hole-guard - full 30 s run, WAV
+ rendered, no crash
+
+MEASURED (bankstorm 30 s, warden 4096 MB):
+- The program change at t~6.5 s drives the DSP to the external-P hole
+  (two wild pcs seen: 0x800010, 0x900010 - valid 24-bit P addresses, no physical
+  backing on the MS2k: internal P ends at 0x18000, boot ROM starts at 0xFF0000).
+  Compiling there read unmapped P -> bad_alloc -> std::terminate (the old crash).
+- FIX: JitBlockChain::create never compiles in [0x18000, 0xFF0000). A bare
+  return froze the machine (measured: 16 billion dispatches, zero cycle
+  progress, t= stuck at 6.53 s) - a garbage fetch on silicon still consumes
+  cycles and advances the PC, so the guard advances one word + 2 cycles
+  (fastForward(1,2) + setPC(_pc+1)). The pending interrupts then come due, the
+  ISR runs and its stacked return pulls execution out of the hole - both wild
+  pcs were ridden through and the machine recovered, exactly like the real
+  synth survives its half-uploaded program changes.
+
+RESULTS:
+- Full 30 s emulated run, clean exit, zero terminate, memory flat.
+- WAV written: 7.9 MB, 30.0 s, 24-bit stereo. REAL SIGNAL at the first
+  program change (t=3-6 s: RMS 0.055/0.057, peak 0.614) - the synth sounds.
+  A full-scale transient at the second change, then silence: the hole-walks
+  dropped ~116K SHI RX bytes (FIFO overruns while the DSP was in the hole),
+  corrupting the second uploaded program. Next: why the SHI IRQ is not
+  serviced during the walks (interrupt-func state instrument added).
+---
+ source/dsp56kEmu/jitblockchain.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/source/dsp56kEmu/jitblockchain.cpp b/source/dsp56kEmu/jitblockchain.cpp
+index 09f4319e..c0ed2f54 100644
+--- a/source/dsp56kEmu/jitblockchain.cpp
++++ b/source/dsp56kEmu/jitblockchain.cpp
+@@ -191,6 +191,29 @@ namespace dsp56k
+ 	// to the trampoline on a flat stack, and the next execOne picks up the freshly compiled block
+ 	const bool runFromHere = _execute && !g_inFuncCreate;
+ 
++	// 2026-10-13 H-bank wild-pc ride-through: the MS2k program change drives the PC into the
++	// external-P hole (measured pc 0x800010 - a valid 24-bit P address with no physical backing on
++	// this machine: internal P is 0x18000 words, the boot ROM starts at 0xFF0000). On real silicon
++	// the half-uploaded program's transient wild jumps ride through: the garbage fetch still
++	// consumes cycles and advances the PC, the pending interrupts come due, and the ISR's stacked
++	// return pulls execution out of the hole. A bare return here froze the machine instead
++	// (measured: 16 billion dispatches, zero cycle progress, t= stuck at 6.53 s), so mirror the
++	// silicon: never compile in the hole, but advance one fetched word and its cycles.
++	if (_pc >= 0x18000 && _pc < 0xFF0000)
++	{
++		static thread_local int s_holeCreate = 0;
++		if ((++s_holeCreate & 1048575) == 1)
++		{
++			const auto& intF = m_jit.dsp().getInterruptFunc();
++			std::fprintf(stderr, "[JIT] create: pc 0x%06X in the external-P hole - advancing; interruptFunc=%p isPeriph=%d\n",
++				_pc, *reinterpret_cast<void* const*>(&intF),
++				intF == m_jit.dsp().getExecPeripheralsFunc() ? 1 : 0);
++		}
++		m_jit.dsp().fastForward(1, 2);
++		m_jit.dsp().setPC(_pc + 1);
++		return;
++	}
++
+ //		LOG("Create @ " << HEX(_pc));// << std::endl << cacheEntry.block->getDisasm());
+ 
+ 		ensureCacheSize(_pc+1);
+-- 
+2.49.0.windows.1
+

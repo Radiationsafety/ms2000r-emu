@@ -6,6 +6,9 @@
 #endif
 #include <exception>
 #include <atomic>
+// 2026-10-12 H-bank vocoder crash hunt: the JIT create()-nesting depth at the moment of the stack overflow
+// (defined in dsp56300/source/dsp56kEmu/jitblockchain.cpp)
+namespace dsp56k { extern std::atomic<int> g_jitCreateDepth; }
 #include <iostream>
 
 static const char* g_crashDir = "dumps";
@@ -17,12 +20,31 @@ void SetCrashReportHook(void (*f)()){ g_crashHook = f; }
 static LONG WINAPI StackOvfVeh(EXCEPTION_POINTERS* ep){
   if (!ep || !ep->ExceptionRecord || ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
   const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-  char line[96];
+  char line[128];
   HANDLE h = GetStdHandle(STD_ERROR_HANDLE); DWORD w = 0;
-  int k = std::snprintf(line, sizeof line, "[CRASH] STACK OVERFLOW at rva %llX\n", (unsigned long long)(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - base));
+  int k = 0;
+  // 2026-10-12 H-bank vocoder crash hunt: the frames were landing in non-exe modules (rva clusters far from
+  // the exe). Name each frame's module + module-relative offset so the next hit resolves without a debugger.
+  auto frameLine = [&](unsigned i, const void* a){
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<const wchar_t*>(a), &mod) && mod) {
+      wchar_t wpath[MAX_PATH] = L"";
+      GetModuleFileNameW(mod, wpath, MAX_PATH);
+      const wchar_t* nm = wcsrchr(wpath, L'\\'); nm = nm ? nm + 1 : wpath;
+      char mb[MAX_PATH]; const int ml = WideCharToMultiByte(CP_UTF8, 0, nm, -1, mb, sizeof mb, nullptr, nullptr);
+      if (ml > 0)
+        k = std::snprintf(line, sizeof line, "[CRASH] frame %2u %s+%llX\n", i, mb,
+                         (unsigned long long)(reinterpret_cast<uintptr_t>(a) - reinterpret_cast<uintptr_t>(mod)));
+      else k = std::snprintf(line, sizeof line, "[CRASH] frame %2u rva %llX\n", i, (unsigned long long)(reinterpret_cast<uintptr_t>(a) - base));
+    } else
+      k = std::snprintf(line, sizeof line, "[CRASH] frame %2u rva %llX (no module)\n", i, (unsigned long long)(reinterpret_cast<uintptr_t>(a) - base));
+    WriteFile(h, line, DWORD(k), &w, nullptr);
+  };
+  k = std::snprintf(line, sizeof line, "[CRASH] STACK OVERFLOW at rva %llX thread %lu jit-create-depth %d\n", (unsigned long long)(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - base), GetCurrentThreadId(), dsp56k::g_jitCreateDepth.load(std::memory_order_relaxed));
   WriteFile(h, line, DWORD(k), &w, nullptr);
   void* fr[40]; const USHORT n = RtlCaptureStackBackTrace(0, 40, fr, nullptr);
-  for (USHORT i = 0; i < n; ++i) { k = std::snprintf(line, sizeof line, "[CRASH] frame %2u rva %llX\n", unsigned(i), (unsigned long long)(reinterpret_cast<uintptr_t>(fr[i]) - base)); WriteFile(h, line, DWORD(k), &w, nullptr); }
+  for (USHORT i = 0; i < n; ++i) frameLine(unsigned(i), fr[i]);
   if (g_crashHook) g_crashHook();
   TerminateProcess(GetCurrentProcess(), 0xC00000FD);
   return EXCEPTION_CONTINUE_SEARCH;

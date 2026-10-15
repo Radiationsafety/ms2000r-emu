@@ -77,6 +77,7 @@ namespace dsp56k
 					++m_hrxEmpty;
 					return 0;
 				}
+				m_hrxReadCycle = m_periph.getDSP().getCycles();
 				++m_hrxReads;	// reading an empty FIFO returns undefined data, zero is as good as anything
 
 				const auto res = m_rx[0];
@@ -135,6 +136,7 @@ namespace dsp56k
 			// "Writing to the HTX register by DSP core instructions or by DMA transfers clears the
 			// HTDE flag", and doing so retires a pending underrun
 			m_htx = _val;
+			m_htxWriteCycle = m_periph.getDSP().getCycles();
 			m_hcsr &= ~static_cast<TWord>((1 << HCSR_HTDE) | (1 << HCSR_HTUE));
 			return;
 		default:

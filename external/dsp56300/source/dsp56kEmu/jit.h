@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstdio>
 
 #include "types.h"
 
@@ -42,6 +43,42 @@ namespace dsp56k
 		~Jit();
 
 		DSP& dsp() { return m_dsp; }
+
+		// 2026-10-12 MS2000 memory-appetite hunt: per-second status line counters
+		size_t getChainCount() const;
+		size_t getCurrentBlockCount() const;
+		size_t getCurrentCodeSize() const;
+		uint64_t getRecreateCount() const;
+
+		// 2026-10-12 MS2000 recreate-pingpong fix: an entry pc that repeatedly triggers destroy+re-emit
+		// rotations (measured: ~75k recreate/s at the boot-ROM entry P:0xFF0000, feeding an asmjit pool
+		// that never shrinks -> 4+ GB commit, host dies) becomes a forced block boundary in
+		// JitBlock::getInfo: no future block may cover it, so the rotation cannot reform. The hotness
+		// map grows only with distinct recreated pcs (bounded by P size); once warm it only does lookups.
+		void markRecreateEntry(const TWord _pc)
+		{
+			if (m_forcedSplits.find(_pc) != m_forcedSplits.end())
+				return;		// already a forced boundary
+			const auto count = ++m_recreateHotness[_pc];
+			if (count == kHotEntryThreshold)
+			{
+				m_forcedSplits.insert(_pc);
+				std::fprintf(stderr, "[JIT] hot entry: pc 0x%06X recreated %u times - forced block boundary added\n", _pc, count);
+			}
+		}
+		const std::set<TWord>& getForcedSplits() const { return m_forcedSplits; }
+
+		// 2026-10-12 recreate-pingpong hunt: the current chain's raw table value at _pc, for the
+		// dispatch-path instruments (compare against what m_jitEntries returned at dispatch time).
+		const void* debugCurrentChainEntry(const TWord _pc) const
+		{
+			if (!m_currentChain)
+				return nullptr;
+			const auto& funcs = m_currentChain->getFuncs();
+			if (_pc >= funcs.size())
+				return nullptr;
+			return *reinterpret_cast<void* const*>(&funcs[_pc]);
+		}
 
 		void exec(const TWord _pc)
 		{
@@ -121,6 +158,11 @@ namespace dsp56k
 
 		std::unordered_map<JitDspMode, std::unique_ptr<JitBlockChain>, DspModeHash> m_chains;
 		JitBlockChain* m_currentChain = nullptr;
+
+		// 2026-10-12 MS2000 recreate-pingpong fix: see markRecreateEntry / getForcedSplits
+		static constexpr uint32_t kHotEntryThreshold = 16;
+		std::unordered_map<TWord, uint32_t> m_recreateHotness;
+		std::set<TWord> m_forcedSplits;
 
 		std::vector<TJitFunc> m_jitFuncs;
 		std::set<TWord> m_volatileP;

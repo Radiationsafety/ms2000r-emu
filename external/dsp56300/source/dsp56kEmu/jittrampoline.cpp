@@ -8,6 +8,14 @@
 
 namespace dsp56k
 {
+	// 2026-10-13 recreate-pingpong hunt: defined in jit.cpp
+	void funcRecreate(JitDspPtr* _jit, TWord _pc) noexcept;
+	void funcRecreateTrace(JitDspPtr* _jit, TWord _pc, const void* _loaded) noexcept;
+
+	// 2026-10-13 hunt: written by the generated execUntilCycles before the dispatch table read
+	volatile uint64_t g_dbgAsmBase = 0;
+	volatile uint64_t g_dbgAsmIndex = 0;
+
 #ifdef HAVE_ARM64
 	constexpr auto g_ptrDSP = JitReg64(22);
 	constexpr auto g_counter = JitReg64(23);
@@ -320,6 +328,8 @@ namespace dsp56k
 		m_asm.mov(asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotClockPtr, 8), asmjit::x86::rax);
 
 		const auto label = m_asm.newNamedLabel("beginExecUntilCycles");
+		// 2026-10-12 MS2000 H-bank crash hunt: the loop-exit label for out-of-window PCs
+		const auto lExitPc = m_asm.newLabel();
 		m_asm.align(asmjit::AlignMode::kCode, 64);
 		m_asm.bind(label);
 
@@ -347,9 +357,24 @@ namespace dsp56k
 		// 2) the block at the current PC: (DspRegs*, PC)
 		m_asm.mov(g_funcToCall, Jitmem::makeRelativePtr(&m_dsp.getJitEntries(), &m_dsp, dsp, 8));
 		m_asm.mov(r32(g_funcArgGPs[1]), Jitmem::makeRelativePtr(&m_dsp.regs().pc.var, &m_dsp, dsp, 4));
-		m_asm.mov(g_funcToCall, Jitmem::makePtr(g_funcToCall, g_funcArgGPs[1], 3, 8));
+
+		// 2026-10-12 MS2000 H-bank crash hunt: never dispatch a pc outside the JIT-covered program
+		// window. m_jitEntries is sized memory().sizeP(); an out-of-window pc (measured 0x800010
+		// during the H-bank program change) reads a function pointer past the table and calls
+		// garbage, and the create thunk would index the block caches with it (measured: bad_alloc,
+		// 26 GB commit growth, std::terminate - the host dies). Exit the loop instead.
+		m_asm.cmp(r32(g_funcArgGPs[1]), asmjit::Imm(static_cast<uint32_t>(m_dsp.memory().sizeP())));
+		m_asm.jae(lExitPc);
+		// 2026-10-12: name the baked window once - if the trampoline is generated before the memory
+		// model is configured, this could be a tiny window and the bootstrap at 0xFF0000 would exit
+		std::fprintf(stderr, "[JIT-TRAMP] execUntilCycles dispatch window baked = 0x%zX\n",
+			static_cast<size_t>(m_dsp.memory().sizeP()));
+		// 2026-10-13: THE recreate-storm fix is in (no displacement). The funcRecreate-compare
+		// trace thunk (cmp + branch in this hot loop) is removed - it identified the storm and
+		// is no longer needed; see the funcRecreate-body diagnostics for recreate accounting.
+		m_asm.mov(g_funcToCall, asmjit::x86::ptr(g_funcToCall, g_funcArgGPs[1], 3));
 		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
-		m_asm.call(g_funcToCall);
+		m_asm.call(r64(g_funcToCall));
 
 		// 3) again while cycles < target
 		m_asm.mov(dsp, asmjit::x86::ptr(asmjit::x86::regs::rsp, g_slotDsp, 8));
@@ -357,6 +382,7 @@ namespace dsp56k
 		m_asm.cmp(Jitmem::makeRelativePtr(&m_dsp.getCycles(), &m_dsp, dsp, 8), scratchA);
 		m_asm.jb(label);
 
+		m_asm.bind(lExitPc);
 		m_asm.add(asmjit::x86::regs::rsp, asmjit::Imm(g_additionalStackSize));
 		for (size_t i=std::size(g_trampolineSavedGPs); i-- > 0;)
 			m_asm.pop(r64(g_trampolineSavedGPs[i]));

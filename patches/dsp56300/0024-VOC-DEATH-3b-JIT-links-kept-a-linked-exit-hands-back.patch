@@ -1,0 +1,168 @@
+From d7a683b1242212712424c5b4b78dd267a2b24c65 Mon Sep 17 00:00:00 2001
+From: Tuth <tuth3378@gmail.com>
+Date: Thu, 15 Oct 2026 04:33:25 +0200
+Subject: [PATCH 24/24] VOC-DEATH-3b: JIT links kept, a linked exit hands back
+ to the dispatcher while an interrupt waits
+
+ee214a3 dropped all JIT block links to get interrupts taken in time; Tamas measured ~5 % more CPU in
+the GUI. Now the links stay (JitConfig::linkJitBlocks) and JitConfig::linkCheckInterrupts makes every
+linked exit test DSP::m_jitIrqCheck first: set by injectInterrupt, cleared when the dispatcher finds
+nothing takeable or has taken the last request. While set, the block stores the PC its child would have
+started at (childAddr; a conditional child's PC is kept in memory instead of being discarded) and
+returns to the dispatcher, which takes the interrupt. A masked request clears the flag: it can only be
+freed by an SR write, and every SR/MR write already ends a block without a link. x64 only.
+
+Forward-only links (linkBackwardJitBlocks=false, MS2K_DSPLINK=fwd) were tried first: 2 resets - Korg's
+idle path is a long FORWARD chain - so they are kept only as an A/B option.
+
+Measured (HostTest 48k/512, 700 ms H09-H16 walk with held notes; each run its own process):
+- 22 s x3: new 0/0/0 resets, wall at 20.5 s 7.87/7.84/7.84 s; old (MS2K_DSPLINK=all) 2/2/2 resets,
+  7.62/7.63/7.65 s; no links (MS2K_DSPLINK=off, ee214a3) 8.15 s -> cost vs old ~3 % instead of ~7 %
+- 30 s: new 0 resets, every job < 2083 cycles (max 1970, avg 1808), sound at 21 s 0.0026 and
+  26-27 s 0.0033/0.0046; old 4 resets, TX exact zero 15-27 s
+- second tweak (keep the PC discard for non-conditional children): 7.88/7.82 s, 0 resets
+
+MS2K_DSPLINK: unset = links + interrupt check, all = links without check (old), off = no links,
+fwd = forward links only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hob75q4ASH4mPmALoirbn6
+---
+ source/dsp56kEmu/dsp.cpp           |  6 ++++++
+ source/dsp56kEmu/dsp.h             |  1 +
+ source/dsp56kEmu/jitblock.cpp      | 31 +++++++++++++++++++++++++++++-
+ source/dsp56kEmu/jitblockchain.cpp |  5 +++++
+ source/dsp56kEmu/jitconfig.h       |  2 ++
+ 5 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 2f0e9b30..836fde06 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -164,6 +164,7 @@ namespace dsp56k
+ 		m_instructions = instructions;
+ 		m_cycles = cycles;
+ 		m_pendingInterrupts.clear();
++		m_jitIrqCheck = 0;
+ 		m_processingMode = Default;
+ 		m_interruptFunc = m_execPeripheralsFunc;
+ 	}
+@@ -364,6 +365,9 @@ namespace dsp56k
+ 		if(best >= m_pendingInterrupts.size())
+ 		{
+ 			// Nothing may be taken now. The requests wait, and the peripherals keep their clock meanwhile.
++			// VOC-DEATH-3b: what waits is masked; only an SR change can free it, and every SR/MR write ends a
++			// JIT block without a link (mode change), so linked chains need not hand back for it.
++			m_jitIrqCheck = 0;
+ 			if(m_pendingInterrupts.empty())
+ 				m_interruptFunc = m_execPeripheralsFunc;
+ 			m_execPeripheralsFunc(this);
+@@ -388,6 +392,7 @@ namespace dsp56k
+ 
+ 		m_processingMode = FastInterrupt;
+ 		m_pendingInterrupts.pop_front();
++		m_jitIrqCheck = m_pendingInterrupts.empty() ? 0 : 1;	// VOC-DEATH-3b: nothing left to hand back for
+ 
+ 		execInterrupt(vba);
+ 	}
+@@ -1440,6 +1445,7 @@ namespace dsp56k
+ 			return true;
+ 
+ 		m_pendingInterrupts.push_back({_interruptVectorAddress});
++		m_jitIrqCheck = 1;	// VOC-DEATH-3b: linked chains hand back to the dispatcher until it has looked at it
+ 
+ 		// MS2000 VOC-DEATH-3 diagnostic (MS2K_IRQBLAT=<n>, after 3e8 cycles): the state an IRQB request meets
+ 		static const int s_latN = [] { const char* e = std::getenv("MS2K_IRQBLAT"); return e ? std::atoi(e) : 0; }();
+diff --git a/source/dsp56kEmu/dsp.h b/source/dsp56kEmu/dsp.h
+index 49b65648..7906b641 100644
+--- a/source/dsp56kEmu/dsp.h
++++ b/source/dsp56kEmu/dsp.h
+@@ -158,6 +158,7 @@ namespace dsp56k
+ 		void execInterruptsByPriority();
+ 	public:
+ 		uint64_t m_intTaken[256] = {};	// MS2000 VOC-DEATH-3 diagnostic: interrupts taken per vector address
++		uint32_t m_jitIrqCheck = 0;		// MS2000 VOC-DEATH-3b: 1 = a request may be takeable, linked JIT jumps return to the dispatcher
+ 	private:
+ 		void onLongInterruptFormed(TWord _vba);
+ 
+diff --git a/source/dsp56kEmu/jitblock.cpp b/source/dsp56kEmu/jitblock.cpp
+index f2f36b1e..94d8b961 100644
+--- a/source/dsp56kEmu/jitblock.cpp
++++ b/source/dsp56kEmu/jitblock.cpp
+@@ -954,7 +954,9 @@ namespace dsp56k
+ 
+ 		const auto pcWritten = m_dspRegPool.isWritten(PoolReg::DspPC);
+ 
+-		if(pcWritten && childrenEstablishPc)
++		// VOC-DEATH-3b: with linkCheckInterrupts a linked exit may return instead; a conditional child's PC must then be
++		// in memory (the other exits store childAddr themselves before returning)
++		if(pcWritten && childrenEstablishPc && !(m_config.linkCheckInterrupts && child && childIsConditional))
+ 			m_dspRegPool.discardWritten(PoolReg::DspPC);
+ 
+ 		_rt.setEstablishesPc(pcWritten || childrenEstablishPc);
+@@ -971,6 +973,33 @@ namespace dsp56k
+ 
+ 		profileEnd(pl);
+ 
++#ifndef HAVE_ARM64
++		/*	MS2000 VOC-DEATH-3b: a linked chain never passes the dispatcher, where pending interrupts are taken. With
++			linkCheckInterrupts every linked exit first tests DSP::m_jitIrqCheck (set by injectInterrupt, cleared when the
++			dispatcher finds nothing takeable) and returns to the dispatcher while it is set. The PC the child would
++			have started at is stored first: childAddr for an unconditional or fall-through child; for a conditional
++			child the block's own PC write already reached memory (its discard is disabled above).
++		*/
++		if(m_config.linkCheckInterrupts && (child || nonBranchChild))
++		{
++			// a temp that is not regPC (still needed for the conditional child compare below)
++			auto t = r64(g_funcArgGPs[1]);
++			if(regPC.isValid() && r64(regPC) == t)
++				t = r64(g_funcArgGPs[2]);
++			const auto noIrq = m_asm.newLabel();
++			m_asm.mov(t, asmjit::Imm(reinterpret_cast<uint64_t>(&m_dsp.m_jitIrqCheck)));
++			m_asm.cmp(asmjit::x86::dword_ptr(t), asmjit::Imm(0));
++			m_asm.jz(noIrq);
++			if(!(child && childIsConditional))
++			{
++				m_asm.mov(t, asmjit::Imm(reinterpret_cast<uint64_t>(&m_dsp.regs().pc.var)));
++				m_asm.mov(asmjit::x86::dword_ptr(t), asmjit::Imm(childAddr));
++			}
++			m_asm.ret();
++			m_asm.bind(noIrq);
++		}
++#endif
++
+ 		asmjit::Label lj;
+ 
+ 		if(child || nonBranchChild)
+diff --git a/source/dsp56kEmu/jitblockchain.cpp b/source/dsp56kEmu/jitblockchain.cpp
+index c0ed2f54..3fa232d9 100644
+--- a/source/dsp56kEmu/jitblockchain.cpp
++++ b/source/dsp56kEmu/jitblockchain.cpp
+@@ -483,6 +483,11 @@ namespace dsp56k
+ 		if (!m_jit.getConfig().linkJitBlocks)
+ 			return nullptr;
+ 
++		// MS2000 VOC-DEATH-3: a link back to the parent's own range or below closes a loop; such a loop would run
++		// linked without returning to the dispatcher, where pending interrupts are taken. Forward links stay.
++		if (!m_jit.getConfig().linkBackwardJitBlocks && _parent && _pc < _parent->getPCFirst() + _parent->getPMemSize())
++			return nullptr;
++
+ 		if (_parent)
+ 			occupyArea(_parent);
+ 
+diff --git a/source/dsp56kEmu/jitconfig.h b/source/dsp56kEmu/jitconfig.h
+index 78ddf922..a37b389a 100644
+--- a/source/dsp56kEmu/jitconfig.h
++++ b/source/dsp56kEmu/jitconfig.h
+@@ -14,6 +14,8 @@ namespace dsp56k
+ 		bool aguSupportMultipleWrapModulo = true;
+ 		bool cacheSingleOpBlocks = true;
+ 		bool linkJitBlocks = true;
++		bool linkBackwardJitBlocks = true;	// MS2000 VOC-DEATH-3: false = only forward links (loops return to the dispatcher)
++		bool linkCheckInterrupts = false;	// MS2000 VOC-DEATH-3b: a linked jump returns to the dispatcher while an interrupt request waits (x64)
+ 		bool splitOpsByNops = false;
+ 		bool dynamicPeripheralAddressing = false;
+ 
+-- 
+2.49.0.windows.1
+
