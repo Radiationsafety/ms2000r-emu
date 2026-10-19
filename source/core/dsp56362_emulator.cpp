@@ -788,8 +788,14 @@ void DSP56362Emulator::runForMcuCycles(uint32_t mcuCycles, uint32_t mcuHz)
             // PERF-DSP-2 (2026-10-01): all the blocks up to the target under one trampoline entry - the same
             // interrupt/peripheral call before every block and the same blocks (see JitTrampoline::execUntilCycles).
             // m_execCalls counts these runs now, not blocks. MS2K_DSPEXECLOOP=1 = the exec() loop (A/B).
+            // PERF-137 probe: MS2K_SKIPDSPCORE=<s> stops the CORE at that MCU time and keeps everything else -
+            // the target, the fs phase, the batching, the audio fill. MS2K_SKIPDSP=1 returns above this, before
+            // the PLL is ever seen, so the MCU's batch dies with it and the two runs are not comparable.
+            static const double skipCoreAt = [] { const char* e = std::getenv("MS2K_SKIPDSPCORE"); return e ? std::atof(e) : -1.0; }();
             static const bool execLoop = [] { const char* e = std::getenv("MS2K_DSPEXECLOOP"); return e && *e == '1'; }();
-            if (execLoop) { while (m_dsp->getCycles() < m_cycleTarget) { m_dsp->exec(); ++m_execCalls; } }
+            const bool skipCore = skipCoreAt >= 0 && double(m_mcuCyclesRun) / 10e6 >= skipCoreAt;
+            if (skipCore) { const_cast<uint64_t&>(m_dsp->getCycles()) = m_cycleTarget; }
+            else if (execLoop) { while (m_dsp->getCycles() < m_cycleTarget) { m_dsp->exec(); ++m_execCalls; } }
             else if (m_dsp->getCycles() < m_cycleTarget) { m_dsp->execUntilCycles(m_cycleTarget); ++m_execCalls; }
         }
         if (!m_batchOk.load(std::memory_order_relaxed)) m_batchOk.store((m_periphX->getEsaiClock().getPCTL() & (1u << 18)) != 0, std::memory_order_relaxed);   // PERF-131: PEN

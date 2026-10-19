@@ -36,6 +36,7 @@ extern "C" void ms2k_phase(const char* p) { g_ms2kPhase = p; }
 #include <bitset>    // i16.txt: For IRQ pending bitmask
 #include <set>       // 2026-09-13: first-touch set for unmapped I/O reporting
 #include <chrono>     // For system_clock (RTC)
+#include <ctime>      // PERF-137: clock_gettime for MS2K_PHASEPROF
 
 extern bool g_h8s_quiet_boot;   // h8s2350_instructions.cpp (global namespace) - PERF-MCU-3
 // PERF-MCU-11/13: portable spellings (the core also builds with GCC/Clang on Linux)
@@ -48,6 +49,14 @@ static inline int ms2kCtz64(uint64_t v) { unsigned long b; _BitScanForward64(&b,
 static inline int ms2kCtz64(uint64_t v) { return __builtin_ctzll(v); }
 #endif
 uint64_t g_ms2kTickNowCalls = 0;   // PERF-MCU: tickPeripheralsNow() calls, MS2K_OPHIST report
+#ifdef MS2K_PHASEPROF
+namespace MS2000 {                          // PERF-137: defined where the instruments are, used in the destructor
+struct PhaseProfStats;
+extern PhaseProfStats g_ms2kPhaseProf;
+void ms2kPhaseProfReport(const PhaseProfStats&);
+inline uint64_t ms2kPfNow() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec); }
+}
+#endif
 uint64_t g_ms2kTickWhy[3] = {}, g_ms2kBudgetLog2[32] = {}, g_ms2kBudgetWhoN[32] = {};
 int g_ms2kBudgetWho = 0;
 static uint64_t g_ms2kOp2Hist[65536] = {};
@@ -311,6 +320,16 @@ H8S2350Emulator::~H8S2350Emulator()
         printf("[OPHIST] batch ends: budget %llu, irq pending %llu, other event %llu; new budget log2:", (unsigned long long)g_ms2kTickWhy[0],
                (unsigned long long)g_ms2kTickWhy[1], (unsigned long long)g_ms2kTickWhy[2]);
         for (int b = 0; b < 32; ++b) if (g_ms2kBudgetLog2[b]) printf(" %d:%llu", b, (unsigned long long)g_ms2kBudgetLog2[b]);
+        // PERF-137: the same data by owner - which peripheral sets the deadline the next batch runs into.
+        static const char* const kBudgetWho[20] = { "none", "SCI1 RX", "SCI1 TX", "SCI0 TX", "ADC", "DMAC pace",
+                                                   "DSP FS", "TPU", "unbounded", "no deadline", "x", "SCI1 RX line",
+                                                   "x", "SCI0 TSR load", "x", "x", "DSP not batchable" };
+        uint64_t whoTot = 0;
+        for (int i = 0; i < 32; ++i) whoTot += g_ms2kBudgetWhoN[i];
+        printf("\n[BUDGETWHO]");
+        for (int i = 0; i < 20; ++i) if (g_ms2kBudgetWhoN[i]) printf(" %s %.1f %%, ", kBudgetWho[i],
+                                                                     100.0 * double(g_ms2kBudgetWhoN[i]) / double(whoTot ? whoTot : 1));
+        printf("\n");
         {   // PERF-MCU: the first two bytes, top 60 (lean path only)
             std::vector<std::pair<uint64_t,int>> w; uint64_t t2 = 0;
             for (int i = 0; i < 65536; ++i) if (g_ms2kOp2Hist[i]) { w.push_back({g_ms2kOp2Hist[i], i}); t2 += g_ms2kOp2Hist[i]; }
@@ -322,6 +341,9 @@ H8S2350Emulator::~H8S2350Emulator()
         for (int b = 0; b < 32; ++b) if (g_ms2kBudgetWhoN[b]) printf(" %d:%llu", b, (unsigned long long)g_ms2kBudgetWhoN[b]);
         printf("\n");
     }
+#ifdef MS2K_PHASEPROF
+    if (std::getenv("MS2K_PHASEPROF")) ms2kPhaseProfReport(g_ms2kPhaseProf);   // PERF-137
+#endif
     if (const char* ca = std::getenv("MS2K_CYCAUDIT"); ca && *ca) {   // CYC-AUDIT report
         uint64_t n = 0, d = 0, t = 0;
         for (auto& a : m_cycAudit) { n += a.n; d += a.direct; t += a.ticked; }
@@ -1098,6 +1120,76 @@ static const bool g_ms2kFirstFault = ms2kAnyEnv({ "MS2K_FIRSTFAULT" });
 static const bool g_ms2kBootPhase = ms2kAnyEnv({ "MS2K_BOOTDEBUG" });
 // PERF-132: the writer-less legacy peripheral blocks in tickPeripherals()
 static const bool g_ms2kLegacyPeriph = ms2kAnyEnv({ "MS2K_LEGACYPERIPH" });
+
+// PERF-137 (2026-10-20, MEASUREMENT, default off - MS2K_PHASEPROF=1): where the MCU side's real CPU time
+// goes. A clock_gettime pair costs 20-40 ns against 10-30 ns for an interpreter instruction, so nothing
+// is timed every time: one step in 64 and one tickPeripherals() call in 4 get a clock pair, and both
+// counters move unconditionally. Two whole-call means and the two counts give the split with no nested
+// timer - the tick runs inside the step that made it, so the interpreter's share is the difference, not
+// another measurement. Nested per-part timers were tried and abandoned: the parts are not a partition
+// (peripheralsSync() re-enters tickPeripheralsNow from the middle of a batch) and a 20 ns part cannot be
+// weighed with a 30 ns scale.
+// What dsp->tickMcu() costs is not timed either - MS2K_DSPTICK=0 skips that call, and the wall-clock
+// difference of the whole run says the same thing with no timer in the loop at all.
+// Compiled out without -DMS2K_PHASEPROF, so a normal run pays nothing.
+#ifdef MS2K_PHASEPROF
+enum Ms2kPhaseBucket { kPfStep = 0, kPfTick, kPfN };
+static const char* const kPfNames[kPfN] = { "a step: the instruction + the tick it made (if any)",
+                                            "a tickPeripherals() call, batched or not" };
+constexpr uint64_t kPfEveryInterp = 64, kPfEveryTick = 4;
+struct PhaseProfStats {
+    uint64_t ns[kPfN] = {}, n[kPfN] = {};
+    uint64_t cStep = 0, cTick = 0, cTickRan = 0;   // unconditional counters; cTickRan is bumped at each
+};                                               // tickPeripherals() site that really runs the peripherals
+PhaseProfStats g_ms2kPhaseProf;
+// One clock pair, drawn by the counter each object advances. The destructor also runs on the early
+// return out of step() and out of tickPeripherals(), so a drawn call is always closed.
+struct PhaseProf {
+    explicit PhaseProf(PhaseProfStats& s) : m_s(s) {
+        m_sample = (++m_s.cStep % kPfEveryInterp) == 0;
+        if (m_sample) m_t0 = ms2kPfNow();
+    }
+    ~PhaseProf() { if (m_sample) { m_s.ns[kPfStep] += ms2kPfNow() - m_t0; ++m_s.n[kPfStep]; } }
+    PhaseProfStats& m_s; uint64_t m_t0 = 0; bool m_sample = false;
+};
+struct PhaseTick {
+    explicit PhaseTick(PhaseProfStats& s) : m_s(s) {
+        m_sample = (++m_s.cTick % kPfEveryTick) == 0;
+        if (m_sample) m_t0 = ms2kPfNow();
+    }
+    ~PhaseTick() { if (m_sample) { m_s.ns[kPfTick] += ms2kPfNow() - m_t0; ++m_s.n[kPfTick]; } }
+    PhaseProfStats& m_s; uint64_t m_t0 = 0; bool m_sample = false;
+};
+void ms2kPhaseProfReport(const PhaseProfStats& s)
+{
+    const auto u = [](uint64_t v) { return (unsigned long long)v; };
+    printf("[PHASEPROF] %llu steps, %llu tickPeripherals() calls (%.1f %% ran the peripherals); "
+           "drawn %llu steps, %llu ticks\n", u(s.cStep), u(s.cTick),
+           s.cTick ? 100.0 * double(s.cTickRan) / double(s.cTick) : 0.0, u(s.n[kPfStep]), u(s.n[kPfTick]));
+    for (int b = 0; b < kPfN; ++b) {
+        if (!s.n[b]) continue;
+        printf("[PHASEPROF] %-48s %10.1f ns each  (%llu samples, 1 in %llu)\n", kPfNames[b],
+               double(s.ns[b]) / double(s.n[b]), u(s.n[b]), u(b == kPfStep ? kPfEveryInterp : kPfEveryTick));
+    }
+    if (s.n[kPfStep] && s.n[kPfTick]) {
+        const double perStep = double(s.ns[kPfStep]) / double(s.n[kPfStep]);
+        const double perTick = double(s.ns[kPfTick]) / double(s.n[kPfTick]);
+        const double ticksPerStep = double(s.cTick) / double(s.cStep);
+        const double tickShare = perTick * ticksPerStep;   // the call is timed whole, batched or not, so
+        printf("[PHASEPROF] per instruction: %.1f ns = %.1f ns tick (%.2f ticks/instr, %.1f %%) + %.1f ns interpreter\n",
+               perStep, tickShare, ticksPerStep, 100.0 * tickShare / perStep, perStep - tickShare);
+        printf("[PHASEPROF] one tick call costs %.1f ns = %.1f whole instructions\n", perTick, perTick / perStep);
+    }
+    fflush(stdout);
+}
+// MS2K_DSPTICK=0: the DSP's tickMcu() call is skipped, so the wall-clock difference of the run is what
+// that one call was worth - no timer around it, and no pacing (the DSP stops advancing; the render is
+// wrong by design, this is a measurement knob only).
+static const bool g_ms2kPfDspTick = [] {
+    const char* e = std::getenv("MS2K_DSPTICK");
+    return !(e && *e == '0');
+}();
+#endif
 // CYC-AUDIT (2026-09-26, R2 measurement, default off): per first opcode byte, how many states the
 // executor adds to m_cycles itself (never ticked to the peripherals) against the states that are ticked.
 static const bool g_ms2kCycAudit = ms2kAnyEnv({ "MS2K_CYCAUDIT" });
@@ -1159,6 +1251,11 @@ void H8S2350Emulator::step()
                        m_registers.exr & 0xFF, (m_registers.exr >> 7) & 1, m_registers.exr & 0x07);
             }
         }
+#ifdef MS2K_PHASEPROF
+        // PERF-137: the step's clock pair covers everything below, the interrupt entry and the tick it
+        // makes included; tickPeripherals() is timed separately and amortised in the report.
+        PhaseProf PPS(g_ms2kPhaseProf);
+#endif
         m_effectivePC = m_registers.pc;
         executeInstructionFast();
         m_cycles_executed++;
@@ -5776,7 +5873,16 @@ static const bool g_ms2kPeriphBatch = [] {
 
 void H8S2350Emulator::tickPeripherals(uint32_t cycles)
 {
-    if (!g_ms2kPeriphBatch || m_peripheral) { tickPeripheralsNow(cycles); return; }
+#ifdef MS2K_PHASEPROF
+    PhaseTick PPT(g_ms2kPhaseProf);   // PERF-137: one clock pair around the whole call, 1 in kPfEveryTick
+#endif
+    if (!g_ms2kPeriphBatch || m_peripheral) {
+#ifdef MS2K_PHASEPROF
+        ++g_ms2kPhaseProf.cTickRan;
+#endif
+        tickPeripheralsNow(cycles);
+        return;
+    }
     if (g_ms2kOpHist) {   // PERF-MCU diag (MS2K_OPHIST): why the batch ends
         if (!(cycles < m_perBudget)) ++g_ms2kTickWhy[0];
         else if ((m_irqPendingCount != 0)) ++g_ms2kTickWhy[1];
@@ -5792,6 +5898,9 @@ void H8S2350Emulator::tickPeripherals(uint32_t cycles)
         return;
     }
     peripheralsSync();
+#ifdef MS2K_PHASEPROF
+    ++g_ms2kPhaseProf.cTickRan;
+#endif
     tickPeripheralsNow(cycles);
     m_perBudget = peripheralBudget();
     if (g_ms2kOpHist) { unsigned b = 0; for (uint64_t v = m_perBudget; v > 1 && b < 31; v >>= 1) ++b; ++g_ms2kBudgetLog2[b]; ++g_ms2kBudgetWhoN[g_ms2kBudgetWho & 31]; }
@@ -5949,7 +6058,11 @@ void H8S2350Emulator::tickPeripheralsNow(uint32_t cycles)
     g_ms2kPhase = "sci1tx"; sci1TxStep(cycles);
     g_ms2kPhase = "sci1rx"; sci1RxStep(cycles);   // BUG108: MIDI IN
     g_ms2kPhase = "sci0tx"; sci0TxStep(cycles);   // BUG77: SCI0 has a transmitter now
+#ifdef MS2K_PHASEPROF
+    g_ms2kPhase = "dsp";   if (m_dsp && g_ms2kPfDspTick) m_dsp->tickMcu(cycles, getClockFrequency());
+#else
     g_ms2kPhase = "dsp";   if (m_dsp) m_dsp->tickMcu(cycles, getClockFrequency());   // BUG105: the DSP56362 runs (PERF-131: lazily)
+#endif
     g_ms2kPhase = "adc";   adcStep(cycles);      // BUG78: the A/D converter takes time too
     g_ms2kPhase = "legacy";
 
