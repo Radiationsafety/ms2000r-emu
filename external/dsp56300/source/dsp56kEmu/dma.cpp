@@ -202,7 +202,17 @@ namespace dsp56k
 			// The data arrives earlier than on the chip, which only matters to firmware that races the DMA
 			m_dataTransferred = execTransfer();
 
-			m_pendingTransfer = std::max(1, static_cast<int32_t>((m_dco + 1) << 1));
+			// EMU-115 (upstream c4b99b8b): DCO is the word count minus one in counter mode A only. Three-dimensional
+			// mode splits it into three counters, and a two-dimensional address on either side selects counter mode B
+			// with two: lines and words per line. The delay took the whole register as the count: $001000 in mode B
+			// is two words and completed after 8194 instructions instead of 4 - firmware that waits for DE, DTD or
+			// the DMA interrupt waited that long, and the emulator burned a second per block doing nothing.
+			const auto dualCounter = getSourceAddressGenMode() <= AddressGenMode::DualCounterDOR3 || getDestinationAddressGenMode() <= AddressGenMode::DualCounterDOR3;
+			const auto words = bitvalue(m_dcr, D3d) ? (m_dcohInit + 1) * (m_dcomInit + 1) * (m_dcolInit + 1)
+				: dualCounter ? (m_dcohInit + 1) * (m_dcolInit + 1)
+				: m_dco + 1;
+
+			m_pendingTransfer = std::max(1, static_cast<int32_t>(words << 1));
 			m_peripherals.setDelayCycles(m_pendingTransfer);
 			m_lastClock = m_peripherals.getDSP().getInstructionCounter();
 			return;
@@ -623,7 +633,7 @@ namespace dsp56k
 		case 0b10:
 			_h = (m_dco >> 18) & 0x3ff;
 			_m = (m_dco >> 12) & 0x3f;
-			_l = (m_dco) & 0xffff;
+			_l = (m_dco) & 0xfff;	// EMU-115: bits 12-15 belong to DCOM, 0xffff moved 4098 words per line
 			break;
 		default:
 			// reserved
