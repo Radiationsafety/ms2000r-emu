@@ -1,7 +1,11 @@
 #include "jitblockchain.h"
 
 #include <atomic>
+#if defined(_MSC_VER)   // macOS SDKs ship no intrin.h
 #include <intrin.h>
+#else
+#define _ReturnAddress() __builtin_return_address(0)
+#endif
 #include <thread>
 #include <functional>
 
@@ -67,15 +71,16 @@ namespace dsp56k
 
 	JitBlockChain::~JitBlockChain()
 	{
-		for (size_t i = 0; i < m_jitCache.size(); ++i)
+		// an entry holds a block or single op cache only where its MMU block was made private
+		m_jitCache.forEachPrivate([this](const size_t _i)
 		{
-			auto& e = m_jitCache[i];
+			auto& e = m_jitCache[_i];
 
 			if(e.block)
 				destroy(e.block);
 
-			releaseSingleOpCache(static_cast<TWord>(i));
-		}
+			releaseSingleOpCache(static_cast<TWord>(_i));
+		});
 
 		m_jitCache.clear();
 	}
@@ -132,7 +137,7 @@ namespace dsp56k
 			}
 		}
 
-		ensureSize(last - 1);
+		ensureSize(first, last - 1);
 
 		for (auto i = first; i < last; ++i)
 		{
@@ -152,7 +157,7 @@ namespace dsp56k
 		const auto first = _block->getPCFirst();
 		const auto last = first + _block->getPMemSize();
 
-		ensureSize(last - 1);
+		ensureSize(first, last - 1);
 
 		for(auto i=first; i<last; ++i)
 		{
@@ -216,7 +221,7 @@ namespace dsp56k
 
 //		LOG("Create @ " << HEX(_pc));// << std::endl << cacheEntry.block->getDisasm());
 
-		ensureCacheSize(_pc+1);
+		ensureCacheSize(_pc, _pc+1);
 
 		if(!makeRoomForFirstInstruction(_pc))
 		{
@@ -497,7 +502,7 @@ namespace dsp56k
 		if(!_allowCreate && _pc >= m_jitCache.size())
 			return nullptr;
 
-		ensureSize(_pc);
+		ensureSize(_pc, _pc);
 
 		{
 			const auto& e = m_jitCache[_pc];
@@ -670,10 +675,10 @@ namespace dsp56k
 		return false;
 	}
 
-	bool JitBlockChain::ensureSize(const size_t _address)
+	bool JitBlockChain::ensureSize(const size_t _first, const size_t _last)
 	{
-		const auto a = m_jitCache.ensureBlockForIndex(_address);
-		const auto b = m_jitFuncs.ensureBlockForIndex(_address);
+		const auto a = m_jitCache.ensureBlocksForRange(_first, _last);
+		const auto b = m_jitFuncs.ensureBlocksForRange(_first, _last);
 		return a || b;
 	}
 
@@ -682,9 +687,9 @@ namespace dsp56k
 		m_jit.onFuncsResized(*this);
 	}
 
-	bool JitBlockChain::ensureCacheSize(const size_t _address)
+	bool JitBlockChain::ensureCacheSize(const size_t _first, const size_t _last)
 	{
-		return m_jitCache.ensureBlockForIndex(_address);
+		return m_jitCache.ensureBlocksForRange(_first, _last);
 	}
 
 	bool JitBlockChain::ensureFuncSize(const size_t _address)

@@ -1,0 +1,647 @@
+diff --git a/source/dsp56kBase/mmuarray.h b/source/dsp56kBase/mmuarray.h
+index 295c578..2e01876 100644
+--- a/source/dsp56kBase/mmuarray.h
++++ b/source/dsp56kBase/mmuarray.h
+@@ -141,6 +141,19 @@ namespace dsp56k
+ 			return ensureBlockFallback(_index);
+ 		}
+ 
++		// Ensure private memory for every block that holds an element of [_first, _last]. A write to an element of a block
++		// that is not private goes to the default block, which every block that is not private shares
++		bool ensureBlocksForRange(size_t _first, size_t _last)
++		{
++			if (!m_useMmu)
++				return ensureBlockFallback(_last);
++
++			bool res = false;
++			for (auto i = _first - _first % m_blockSize; i <= _last; i += m_blockSize)
++				res |= ensureBlockMmu(i);
++			return res;
++		}
++
+ 		// Ensure size covers at least _index+1 entries (non-MMU grow, MMU no-op if in range)
+ 		bool ensureSize(size_t _index)
+ 		{
+@@ -155,6 +168,28 @@ namespace dsp56k
+ 			return ensureBlockFallback(_index);
+ 		}
+ 
++		// Calls _func with the index of every element that may differ from the fill: all of them in fallback mode, else
++		// those of the blocks that ensureBlockForIndex() made private. Reading the others maps the default block into
++		// every page of the range, which takes seconds for a large one
++		template<typename TFunc> void forEachPrivate(TFunc _func)
++		{
++			if (!m_useMmu)
++			{
++				for (size_t i = 0; i < m_size; ++i)
++					_func(i);
++				return;
++			}
++
++			for (size_t b = 0; b < m_numBlocks; ++b)
++			{
++				if (!m_blockIsPrivate[b])
++					continue;
++
++				for (size_t i = b * m_blockSize; i < (b + 1) * m_blockSize; ++i)
++					_func(i);
++			}
++		}
++
+ 		void setResizedCallback(ResizedCallback _cb) { m_resizedCallback = std::move(_cb); }
+ 
+ 		void clear()
+diff --git a/source/dsp56kBase/mmuhelper.cpp b/source/dsp56kBase/mmuhelper.cpp
+index 6a456c9..8ceb71e 100644
+--- a/source/dsp56kBase/mmuhelper.cpp
++++ b/source/dsp56kBase/mmuhelper.cpp
+@@ -15,6 +15,7 @@
+ #	include <sys/mman.h>
+ #	include <sys/stat.h>
+ #	include <sstream>
++#	include <atomic>
+ #endif
+ 
+ namespace dsp56k
+@@ -222,19 +223,21 @@ namespace dsp56k
+ 	{
+ 		if (m_basePtr == nullptr)
+ 			return;
+-		// On Linux, the base allocation is replaced by individual mappings.
+-		// We do not munmap the whole block as it was already overwritten by
+-		// the individual mapRegion calls. Just clear the pointer.
++		// unmapRegion never leaves a hole, the whole range is still ours
++		munmap(m_basePtr, m_basePtrSize);
+ 		m_basePtr = nullptr;
+ 		m_basePtrSize = 0;
+ 	}
+ 
+ 	bool MmuHelper::createBackingStore(const size_t _byteSize)
+ 	{
+-		static uint32_t g_uid = 0;
++		static std::atomic<uint32_t> g_uid{0};
+ 
++		// The name is system-wide: 'this' separates instances within a process, the pid separates processes
++		// that have an instance at the same address (always the case without ASLR, i.e. under a debugger).
++		// Hex and a short prefix: macOS limits the name to 31 characters (PSHMNAMLEN), longer ones fail with ENAMETOOLONG
+ 		std::stringstream name;
+-		name << "dsp56300_" << reinterpret_cast<uint64_t>(this) << '_' << g_uid++;
++		name << "dsp_" << std::hex << getpid() << '_' << reinterpret_cast<uint64_t>(this) << '_' << g_uid++;
+ 		const std::string na(name.str());
+ 
+ 		int fd = shm_open(na.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+@@ -286,7 +289,10 @@ namespace dsp56k
+ 			return false;
+ 		}
+ 		munlock(_addr, it->second);
+-		const auto res = munmap(_addr, it->second) == 0;
++		// Replace the mapping with a reservation instead of munmapping it. A munmap leaves a hole until the
++		// next MAP_FIXED mapRegion, and an mmap on another thread (another DSP's JIT) can be placed into it.
++		// The MAP_FIXED then silently overwrites that allocation. Same race as the Windows placeholder fix.
++		const auto res = mmap(_addr, it->second, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, InvalidHandle, 0) == _addr;
+ 		m_mappedRegions.erase(it);
+ 		if (!res)
+ 			LOG("MmuHelper: Failed to unmap memory, err " << errno);
+diff --git a/source/dsp56kBase/semaphore.h b/source/dsp56kBase/semaphore.h
+index 2cb7738..bc99e5e 100644
+--- a/source/dsp56kBase/semaphore.h
++++ b/source/dsp56kBase/semaphore.h
+@@ -88,11 +88,15 @@ namespace dsp56k
+ 		{
+ 		}
+ 
++		// The one waiter waits for its whole deficit at once and gets one inner credit when the notifies have covered
++		// it: a wait for a block of frames wakes once, not once per frame. A negative count is always that one
++		// waiter's deficit, so the notify that takes the count from below zero to zero or above is the one to wake it,
++		// and no other notify posts a credit that a later wait could consume without anything produced
+ 		void notify()
+ 		{
+ 			const auto prev = m_count.fetch_add(1, std::memory_order_release);
+ 
+-	        if (prev < 0)
++	        if (prev == -1)
+ 		        m_sem.notify();
+ 		}
+ 
+@@ -100,20 +104,8 @@ namespace dsp56k
+ 		{
+ 			const auto prev = m_count.fetch_add(static_cast<int>(_count), std::memory_order_release);
+ 
+-	        if (prev < 0)
+-	        {
+-				// Post exactly one inner credit per waiter in deficit, i.e. min(_count, -prev). Posting
+-				// _count regardless mints spurious credits whenever the deficit is smaller than the batch:
+-				// they sit in the inner semaphore forever, and a later wait() that goes into deficit consumes
+-				// one and returns although nothing was produced - the consumer reads a frame that is not
+-				// there and the ring counters desync from the semaphore counts. With the batched ring pushes
+-				// (emplace_back(count)/pop_front(count)) racing single-frame pops this intermittently
+-				// corrupted frames and permanently wedged the audio pipeline.
+-				const auto deficit = -prev;
+-				const auto wake = deficit < static_cast<int>(_count) ? deficit : static_cast<int>(_count);
+-				for (int i = 0; i < wake; ++i)
+-					m_sem.notify();
+-	        }
++	        if (prev < 0 && prev + static_cast<int>(_count) >= 0)
++				m_sem.notify();
+ 		}
+ 
+ 		void wait()
+@@ -131,12 +123,7 @@ namespace dsp56k
+ 			const int prev = m_count.fetch_sub(count, std::memory_order_acquire);
+ 
+ 			if (prev < count)
+-			{
+-				// This call's own deficit is count - max(prev, 0): a negative prev belongs to waits that
+-				// already accounted for it themselves (mirror of the notify() clamp above).
+-				for (int i = prev > 0 ? prev : 0; i < count; ++i)
+-					m_sem.wait();
+-			}
++				m_sem.wait();
+ 		}
+ 
+ 		bool tryWait()
+diff --git a/source/dsp56kEmu/agu.h b/source/dsp56kEmu/agu.h
+index ac3853c..a267d7c 100644
+--- a/source/dsp56kEmu/agu.h
++++ b/source/dsp56kEmu/agu.h
+@@ -55,9 +55,10 @@ namespace dsp56k
+ 
+ 				modulo = n & moduloMask ? modulo : 0;
+ 
+-				if(r < lowerBound)
++				// signed, as in the JIT: a buffer at address zero goes below it, and unsigned that reads as a huge address
++				if(static_cast<int32_t>(r) < static_cast<int32_t>(lowerBound))
+ 					r += modulo;
+-				if(r > upperBound)
++				if(static_cast<int32_t>(r) > static_cast<int32_t>(upperBound))
+ 					r -= modulo;
+ 				/*
+ 				if constexpr(add)
+diff --git a/source/dsp56kEmu/audio.cpp b/source/dsp56kEmu/audio.cpp
+index 290c52a..50a01bc 100644
+--- a/source/dsp56kEmu/audio.cpp
++++ b/source/dsp56kEmu/audio.cpp
+@@ -10,20 +10,20 @@ namespace dsp56k
+ 
+ 		if(_useRingBuffers)
+ 		{
+-			m_readRxCallback = [this](uint64_t& _frameIndex, RxFrame& _values)
++			setReadRxCallback([this](uint64_t& _frameIndex, RxFrame& _values)
+ 			{
+ 				m_audioInputs.waitNotEmpty();
+ 				_values = m_audioInputs.pop_front();
+ 				++_frameIndex;
+-			};
++			});
+ 
+-			m_writeTxCallback = [this](uint64_t& _frameIndex, const TxFrame& _values)
++			setWriteTxCallback([this](uint64_t& _frameIndex, const TxFrame& _values)
+ 			{
+ 				m_audioOutputs.waitNotFull();
+ 				m_audioOutputs.push_back(_values);
+ 				++_frameIndex;
+ 				(*m_callback.load(std::memory_order_acquire))(this);
+-			};
++			});
+ 		}
+ 	}
+ 
+@@ -51,13 +51,15 @@ namespace dsp56k
+ 	{
+ 		if (m_terminated.load(std::memory_order_acquire))
+ 			return;
+-		m_readRxCallback(m_readFrameIndex, _values);
++		if (const auto* cb = m_readRxCallback.load(std::memory_order_acquire); cb && *cb)
++			(*cb)(m_readFrameIndex, _values);
+ 	}
+ 
+ 	void Audio::writeTXimpl(const TxFrame& _values)
+ 	{
+ 		if (m_terminated.load(std::memory_order_acquire))
+ 			return;
+-		m_writeTxCallback(m_writeFrameIndex, _values);
++		if (const auto* cb = m_writeTxCallback.load(std::memory_order_acquire); cb && *cb)
++			(*cb)(m_writeFrameIndex, _values);
+ 	}
+ }
+diff --git a/source/dsp56kEmu/audio.h b/source/dsp56kEmu/audio.h
+index 07da59a..cedb303 100644
+--- a/source/dsp56kEmu/audio.h
++++ b/source/dsp56kEmu/audio.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+@@ -122,8 +123,9 @@ namespace dsp56k
+ 
+ 		void terminate();
+ 
+-		void setReadRxCallback(ReadRxCallback _callback) { m_readRxCallback = std::move(_callback); }
+-		void setWriteTxCallback(WriteTxCallback _callback) { m_writeTxCallback = std::move(_callback); }
++		// Published like setCallback() below: voice expansion swaps them while the DSP thread may be inside one
++		void setReadRxCallback(ReadRxCallback _callback) { publish(m_readRxCallback, m_readRxCallbacks, std::move(_callback)); }
++		void setWriteTxCallback(WriteTxCallback _callback) { publish(m_writeTxCallback, m_writeTxCallbacks, std::move(_callback)); }
+ 
+ 		bool hasRingBuffers() const { return m_useRingBuffers; }
+ 
+@@ -215,13 +217,18 @@ namespace dsp56k
+ 		template<typename T, typename TFunc>
+ 		void processAudioOutput(const uint32_t _frames, const TFunc& _readOutputCbk)
+ 		{
+-			for (uint32_t i = 0; i < _frames; ++i)
++			// One wait for many frames: a wait per frame woke this thread for every frame the DSP wrote. At most half
++			// of the ring at once, the DSP must find room for the frames after them
++			constexpr uint32_t maxChunk = static_cast<uint32_t>(decltype(m_audioOutputs)::capacity() / 2);
++
++			for (uint32_t i = 0; i < _frames;)
+ 			{
+-				m_audioOutputs.waitNotEmpty();
+-				m_audioOutputs.pop_front([&](TxFrame& _frame)
++				const auto count = std::min(_frames - i, maxChunk);
++				m_audioOutputs.pop_front(count, [&](const size_t _j, TxFrame& _frame)
+ 				{
+-					_readOutputCbk(i, _frame);
++					_readOutputCbk(i + static_cast<uint32_t>(_j), _frame);
+ 				});
++				i += count;
+ 			}
+ 		}
+ 
+@@ -303,8 +310,18 @@ namespace dsp56k
+ 
+ 		std::atomic<bool> m_terminated{false};
+ 
+-		ReadRxCallback m_readRxCallback;
+-		WriteTxCallback m_writeTxCallback;
++		template<typename T> static void publish(std::atomic<const T*>& _current, std::vector<std::unique_ptr<T>>& _owned, T&& _callback)
++		{
++			auto cb = std::make_unique<T>(std::move(_callback));
++			auto* const c = cb.get();
++			_owned.emplace_back(std::move(cb));
++			_current.store(c, std::memory_order_release);
++		}
++
++		std::atomic<const ReadRxCallback*> m_readRxCallback{nullptr};
++		std::atomic<const WriteTxCallback*> m_writeTxCallback{nullptr};
++		std::vector<std::unique_ptr<ReadRxCallback>> m_readRxCallbacks;
++		std::vector<std::unique_ptr<WriteTxCallback>> m_writeTxCallbacks;
+ 		uint64_t m_readFrameIndex = 0;
+ 		uint64_t m_writeFrameIndex = 0;
+ 	};
+diff --git a/source/dsp56kEmu/disasm.cpp b/source/dsp56kEmu/disasm.cpp
+index 6be49a3..1f195e8 100644
+--- a/source/dsp56kEmu/disasm.cpp
++++ b/source/dsp56kEmu/disasm.cpp
+@@ -2219,8 +2219,9 @@ namespace dsp56k
+ 
+ 		if(Opcodes::isNonParallelOpcode(op))
+ 		{
++			// an undefined opcode decodes as ILLEGAL, see Opcodes::findNonParallelOpcodeInfo, but it is data here
+ 			const auto* oi = m_opcodes.findNonParallelOpcodeInfo(op);
+-			if(oi)
++			if(oi && match(*oi, op))
+ 			{
+ 				m_line.opName = g_opNames[oi->m_instruction];
+ 				m_line.instA = oi->m_instruction;
+diff --git a/source/dsp56kEmu/dsp.cpp b/source/dsp56kEmu/dsp.cpp
+index 25f9a6e..00f0710 100644
+--- a/source/dsp56kEmu/dsp.cpp
++++ b/source/dsp56kEmu/dsp.cpp
+@@ -673,15 +673,27 @@ namespace dsp56k
+ 		// __________________
+ 		//
+ 
++		/*	The loop ends where the chip decides it, at the fetch of the word at LA: when the instruction that ends at LA
++			falls through, or when a call at LA returns there. A jump or call from the body that merely lands at LA+1
++			does not count. It was taken for a loop end, the code at LA+1 never ran and the call's return address stayed
++			on the stack. Found by helica1 (dsp56300 PR #15)
++		*/
++		bool fetchedLA = false;
++
+ 		// note the terminate check: the interpreter executes a whole DO loop inside this function, it never returns
+ 		// to DSPThread::threadFunc in between. Without it, a firmware loop that never ends deadlocks the join on shutdown.
+ 		while(reg.sc.var >= stackCount && !m_terminate.load(std::memory_order_relaxed))
+ 		{
+ 			execInterpreter();
+ 
+-			if(reg.pc.var != (reg.la.var+1))
++			if(pcCurrentInstruction + m_currentOpLen == reg.la.var + 1)
++				fetchedLA = true;
++
++			if(reg.pc.var != (reg.la.var+1) || !fetchedLA)
+ 				continue;
+ 
++			fetchedLA = false;
++
+ 			if(!sr_test_noCache(SR_LF))
+ 				break;
+ 
+@@ -1224,6 +1236,11 @@ namespace dsp56k
+ 
+ 	void DSP::notifyProgramMemWrite(TWord _offset)
+ 	{
++		// the cache covers internal P only. memWriteP checks before it calls, a write the JIT reports (jit.cpp)
++		// or a boot-code invalidate (dspBootCode.cpp) does not - upstream cdaabf25, written for this fork's layout
++		if (_offset >= m_opcodeCache.size())
++			return;
++
+ 		m_opcodeCache[_offset].op = &DSP::op_ResolveCache;
+ 		if constexpr(!g_useJIT)
+ 			m_opcodeCycleCache[_offset] = 0;
+diff --git a/source/dsp56kEmu/dsp_ops.inl b/source/dsp56kEmu/dsp_ops.inl
+index 67c7932..bf099d7 100644
+--- a/source/dsp56kEmu/dsp_ops.inl
++++ b/source/dsp56kEmu/dsp_ops.inl
+@@ -621,24 +621,8 @@ namespace dsp56k
+ 			exec_jump(cacheEntry.op, op);
+ 			return;
+ 		}
+-		const auto* oiMove = m_opcodes.findParallelMoveOpcodeInfo(op);
+-		if(!oiMove)
+-		{
+-			m_opcodes.findParallelMoveOpcodeInfo(op);		// retry here to help debugging
+-			assert(0 && "illegal instruction");
+-		}
+-
+-		const OpcodeInfo* oiAlu = nullptr;
+-
+-		if(op & 0xff)
+-		{
+-			oiAlu = m_opcodes.findParallelAluOpcodeInfo(op);
+-			if(!oiAlu)
+-			{
+-				m_opcodes.findParallelAluOpcodeInfo(op);	// retry here to help debugging
+-				assert(0 && "invalid instruction");						
+-			}
+-		}
++		const OpcodeInfo* oiAlu;
++		const auto* oiMove = m_opcodes.findParallelOpcodeInfo(op, oiAlu);
+ 
+ 		switch (oiMove->m_instruction)
+ 		{
+diff --git a/source/dsp56kEmu/hdi08.cpp b/source/dsp56kEmu/hdi08.cpp
+index 38f0bf4..06e9688 100644
+--- a/source/dsp56kEmu/hdi08.cpp
++++ b/source/dsp56kEmu/hdi08.cpp
+@@ -219,12 +219,6 @@ namespace dsp56k
+ 		return m_dataRX.full();
+ 	}
+ 
+-	void HDI08::terminate()
+-	{
+-		while(!m_dataRX.full())
+-			m_dataRX.push_back(0);
+-	}
+-
+ 	TWord HDI08::readHDR() const
+ 	{
+ //		LOG("Read HDR: " << HEX(m_hdr));
+diff --git a/source/dsp56kEmu/hdi08.h b/source/dsp56kEmu/hdi08.h
+index 53c97c4..3341f1a 100644
+--- a/source/dsp56kEmu/hdi08.h
++++ b/source/dsp56kEmu/hdi08.h
+@@ -122,8 +122,6 @@ namespace dsp56k
+ 
+ 		bool dataRXFull() const;
+ 
+-		void terminate();
+-
+ 		TWord readHDR() const;
+ 		void writeHDR(TWord _val);
+ 
+diff --git a/source/dsp56kEmu/jitblockchain.cpp b/source/dsp56kEmu/jitblockchain.cpp
+index 3fa232d..efaaa33 100644
+--- a/source/dsp56kEmu/jitblockchain.cpp
++++ b/source/dsp56kEmu/jitblockchain.cpp
+@@ -67,15 +67,16 @@ namespace dsp56k
+ 
+ 	JitBlockChain::~JitBlockChain()
+ 	{
+-		for (size_t i = 0; i < m_jitCache.size(); ++i)
++		// an entry holds a block or single op cache only where its MMU block was made private
++		m_jitCache.forEachPrivate([this](const size_t _i)
+ 		{
+-			auto& e = m_jitCache[i];
++			auto& e = m_jitCache[_i];
+ 
+ 			if(e.block)
+ 				destroy(e.block);
+ 
+-			releaseSingleOpCache(static_cast<TWord>(i));
+-		}
++			releaseSingleOpCache(static_cast<TWord>(_i));
++		});
+ 
+ 		m_jitCache.clear();
+ 	}
+@@ -132,7 +133,7 @@ namespace dsp56k
+ 			}
+ 		}
+ 
+-		ensureSize(last - 1);
++		ensureSize(first, last - 1);
+ 
+ 		for (auto i = first; i < last; ++i)
+ 		{
+@@ -152,7 +153,7 @@ namespace dsp56k
+ 		const auto first = _block->getPCFirst();
+ 		const auto last = first + _block->getPMemSize();
+ 
+-		ensureSize(last - 1);
++		ensureSize(first, last - 1);
+ 
+ 		for(auto i=first; i<last; ++i)
+ 		{
+@@ -216,7 +217,7 @@ namespace dsp56k
+ 
+ //		LOG("Create @ " << HEX(_pc));// << std::endl << cacheEntry.block->getDisasm());
+ 
+-		ensureCacheSize(_pc+1);
++		ensureCacheSize(_pc, _pc+1);
+ 
+ 		if(!makeRoomForFirstInstruction(_pc))
+ 		{
+@@ -497,7 +498,7 @@ namespace dsp56k
+ 		if(!_allowCreate && _pc >= m_jitCache.size())
+ 			return nullptr;
+ 
+-		ensureSize(_pc);
++		ensureSize(_pc, _pc);
+ 
+ 		{
+ 			const auto& e = m_jitCache[_pc];
+@@ -670,10 +671,10 @@ namespace dsp56k
+ 		return false;
+ 	}
+ 
+-	bool JitBlockChain::ensureSize(const size_t _address)
++	bool JitBlockChain::ensureSize(const size_t _first, const size_t _last)
+ 	{
+-		const auto a = m_jitCache.ensureBlockForIndex(_address);
+-		const auto b = m_jitFuncs.ensureBlockForIndex(_address);
++		const auto a = m_jitCache.ensureBlocksForRange(_first, _last);
++		const auto b = m_jitFuncs.ensureBlocksForRange(_first, _last);
+ 		return a || b;
+ 	}
+ 
+@@ -682,9 +683,9 @@ namespace dsp56k
+ 		m_jit.onFuncsResized(*this);
+ 	}
+ 
+-	bool JitBlockChain::ensureCacheSize(const size_t _address)
++	bool JitBlockChain::ensureCacheSize(const size_t _first, const size_t _last)
+ 	{
+-		return m_jitCache.ensureBlockForIndex(_address);
++		return m_jitCache.ensureBlocksForRange(_first, _last);
+ 	}
+ 
+ 	bool JitBlockChain::ensureFuncSize(const size_t _address)
+diff --git a/source/dsp56kEmu/jitblockchain.h b/source/dsp56kEmu/jitblockchain.h
+index d656771..615b13b 100644
+--- a/source/dsp56kEmu/jitblockchain.h
++++ b/source/dsp56kEmu/jitblockchain.h
+@@ -108,9 +108,9 @@ namespace dsp56k
+ 		bool isBeingGeneratedRecursive(const JitBlockRuntimeData* _block) const;
+ 		bool isBeingGenerated(const JitBlockRuntimeData* _block) const;
+ 
+-		bool ensureCacheSize(size_t _address);
++		bool ensureCacheSize(size_t _first, size_t _last);
+ 		bool ensureFuncSize(size_t _address);
+-		bool ensureSize(size_t _address);
++		bool ensureSize(size_t _first, size_t _last);
+ 
+ 		void onFuncsResized() const;
+ 
+diff --git a/source/dsp56kEmu/jitops.cpp b/source/dsp56kEmu/jitops.cpp
+index 0ecb794..5b4a79b 100644
+--- a/source/dsp56kEmu/jitops.cpp
++++ b/source/dsp56kEmu/jitops.cpp
+@@ -301,24 +301,8 @@ namespace dsp56k
+ 			return;
+ 		}
+ 
+-		const auto* oiMove = m_opcodes.findParallelMoveOpcodeInfo(_op);
+-		if(!oiMove)
+-		{
+-			m_opcodes.findParallelMoveOpcodeInfo(_op);		// retry here to help debugging
+-			assert(0 && "illegal instruction");
+-		}
+-
+-		const OpcodeInfo* oiAlu = nullptr;
+-
+-		if(_op & 0xff)
+-		{
+-			oiAlu = m_opcodes.findParallelAluOpcodeInfo(_op);
+-			if(!oiAlu)
+-			{
+-				m_opcodes.findParallelAluOpcodeInfo(_op);	// retry here to help debugging
+-				assert(0 && "invalid instruction");						
+-			}
+-		}
++		const OpcodeInfo* oiAlu;
++		const auto* oiMove = m_opcodes.findParallelOpcodeInfo(_op, oiAlu);
+ 
+ 		switch (oiMove->m_instruction)
+ 		{
+diff --git a/source/dsp56kEmu/opcodes.cpp b/source/dsp56kEmu/opcodes.cpp
+index f903861..83d9e58 100644
+--- a/source/dsp56kEmu/opcodes.cpp
++++ b/source/dsp56kEmu/opcodes.cpp
+@@ -72,7 +72,16 @@ namespace dsp56k
+ 	const OpcodeInfo* Opcodes::findNonParallelOpcodeInfo(TWord _opcode) const
+ 	{
+ 		assert(isNonParallelOpcode(_opcode));
+-		return findOpcodeInfo(_opcode, m_opcodesNonParallel);
++
++		if(const auto* oi = findOpcodeInfo(_opcode, m_opcodesNonParallel))
++			return oi;
++
++		/*	The chip runs any undefined operation code as ILLEGAL (56300 FM 2.3.2.2): a NOP, then the illegal instruction
++			interrupt. Firmware has been seen to run $000040, which the JIT compiled as an empty block that it entered over
++			and over, until the stack overflowed. The disassembler prints such a word as data, see
++			Disassembler::disassemble
++		*/
++		return &getOpcodeInfoAt(Illegal);
+ 	}
+ 
+ 	const OpcodeInfo* Opcodes::findParallelMoveOpcodeInfo(TWord _opcode) const
+@@ -87,6 +96,26 @@ namespace dsp56k
+ 		return findOpcodeInfo(_opcode, m_opcodesAlu);
+ 	}
+ 
++	const OpcodeInfo* Opcodes::findParallelOpcodeInfo(const TWord _opcode, const OpcodeInfo*& _alu) const
++	{
++		/*	As the reference simulator runs them: a word whose move field matches no move is ILLEGAL and its ALU operation
++			does not run, $083100 and $083110 take the illegal instruction interrupt and $083110 adds nothing. An ALU byte
++			that matches no operation does nothing, the move runs alone, $080004 runs as $080000. Both used to decode to
++			nullptr, which the JIT dereferenced, or to a word of length 0 that the JIT decoded over and over.
++			The disassembler prints both as data, as the simulator does, see Disassembler::disassemble
++		*/
++		const auto* oiMove = findParallelMoveOpcodeInfo(_opcode);
++
++		if(!oiMove)
++		{
++			_alu = nullptr;
++			return &getOpcodeInfoAt(Illegal);
++		}
++
++		_alu = (_opcode & 0xff) ? findParallelAluOpcodeInfo(_opcode) : nullptr;
++		return oiMove;
++	}
++
+ 	const OpcodeInfo& Opcodes::getOpcodeInfoAt(size_t _index)
+ 	{
+ 		return g_opcodes[_index];
+@@ -146,8 +175,8 @@ namespace dsp56k
+ 			return 1;
+ 		}
+ 
+-		const auto* oiAlu = (_op & 0xff) ? findParallelAluOpcodeInfo(_op) : nullptr;
+-		const auto* oiMove = findParallelMoveOpcodeInfo(_op);
++		const OpcodeInfo* oiAlu;
++		const auto* oiMove = findParallelOpcodeInfo(_op, oiAlu);
+ 
+ 		uint32_t res = 0;
+ 
+diff --git a/source/dsp56kEmu/opcodes.h b/source/dsp56kEmu/opcodes.h
+index d59ab0a..bbc749c 100644
+--- a/source/dsp56kEmu/opcodes.h
++++ b/source/dsp56kEmu/opcodes.h
+@@ -268,6 +268,10 @@ namespace dsp56k
+ 		const OpcodeInfo* findParallelMoveOpcodeInfo(TWord _opcode) const;
+ 		const OpcodeInfo* findParallelAluOpcodeInfo(TWord _opcode) const;
+ 
++		// What a parallel word runs: the move it returns, ILLEGAL for a word that is not defined, and the ALU operation
++		// in _alu, nullptr for none
++		const OpcodeInfo* findParallelOpcodeInfo(TWord _opcode, const OpcodeInfo*& _alu) const;
++
+ 		static bool isParallelOpcode(const TWord _opcode)
+ 		{
+ 			return OpcodeInfo::isParallelOpcode(_opcode);
+diff --git a/source/dsp56kEmu/peripherals.cpp b/source/dsp56kEmu/peripherals.cpp
+index 20d687f..d80e669 100644
+--- a/source/dsp56kEmu/peripherals.cpp
++++ b/source/dsp56kEmu/peripherals.cpp
+@@ -376,7 +376,9 @@ namespace dsp56k
+ 
+ 	void Peripherals56303::terminate()
+ 	{
+-		m_hi08.terminate();
++		// Not the HI08: the DSP never waits for host data, an empty receive register reads 0. Filling the receive FIFO
++		// made the DSP, which runs until its thread sees the request, take thousands of words that no host sent. The XT
++		// stores host words into a 32 word buffer by interrupt, and they overwrote the code pointer that follows it
+ 		m_essi0.terminate();
+ 		m_essi1.terminate();
+ 	}
+@@ -775,7 +777,7 @@ namespace dsp56k
+ 
+ 	void Peripherals56362::terminate()
+ 	{
+-		m_hdi08.terminate();
++		// not the HDI08, see Peripherals56303::terminate
+ 		m_esai.terminate();
+ 	}
+ 

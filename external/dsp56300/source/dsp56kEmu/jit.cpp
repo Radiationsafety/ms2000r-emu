@@ -1,6 +1,10 @@
 #include "jit.h"
 
+#if defined(_MSC_VER)   // macOS SDKs ship no intrin.h
 #include <intrin.h>
+#else
+#define _ReturnAddress() __builtin_return_address(0)
+#endif
 #include <thread>
 #include <functional>
 
