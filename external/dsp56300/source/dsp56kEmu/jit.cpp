@@ -466,22 +466,8 @@ namespace dsp56k
 	{
 		const auto* block = m_currentChain->getBlockUnsafe(_pc);
 
-		// 2026-10-12 recreate-pingpong hunt: the execOne path dispatches block->getFunc(); if that is
-		// &funcRecreate, we found the 75k/s destroy/re-emit loop's entry. The caller address names
-		// the wrapper (funcRunCheckPMemWrite / ModeChange / LoopEnd / plain).
-		{
-			static thread_local int s_prun = 0;
-			if (s_prun < 20)
-			{
-				++s_prun;
-				std::fprintf(stderr, "[TR] run(0x%06X) blockFirst=0x%06X func=%p isRecreate=%d caller=%p\n",
-					_pc,
-					block ? block->getPCFirst() : 0xFFFFFF,
-					block ? *reinterpret_cast<void* const*>(&block->getFunc()) : nullptr,
-					block && block->getFunc() == &funcRecreate ? 1 : 0,
-					_ReturnAddress());
-			}
-		}
+		// PERF-133: the 2026-10-12 recreate-pingpong fprintf guard is gone from this hot path - the hunt
+		// it served is closed and recreated blocks are counted in the status line (recreates=) anyway.
 		m_trampoline.execOne(&m_dsp.regs(), _pc, block->getFunc());
 
 		if(g_traceOps && m_dsp.m_trace)

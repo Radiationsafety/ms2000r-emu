@@ -346,9 +346,12 @@ bool Ms2kRunner::tick1ms() {
 // and the housekeeping after every 20,000th step are the same as tick1ms()'s; only where render() may stop
 // (and inject MIDI) is finer.
 bool Ms2kRunner::runSteps(int n) {
+    // PERF-133 measurement probe (default off): MS2K_NOHK=1 skips the per-tick housekeeping
+    // (panel scan, LCD, MP tick) - behaviour breaks, the wall difference attributes its CPU share.
+    static const bool nohk = [] { const char* e = std::getenv("MS2K_NOHK"); return e && *e == '1'; }();
     while (n-- > 0 && m_running) {
         m_cpu->step();
-        if (++m_tickPos >= m_cfg.cpuCyclesPerTick) { m_tickPos = 0; tickHousekeeping(); }
+        if (++m_tickPos >= m_cfg.cpuCyclesPerTick) { m_tickPos = 0; if (!nohk) tickHousekeeping(); }
     }
     return m_running.load();
 }

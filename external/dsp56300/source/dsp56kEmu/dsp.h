@@ -286,19 +286,8 @@ namespace dsp56k
 
 			auto f = m_jitEntries[_pc];
 
-			// 2026-10-12 recreate-pingpong hunt: if this C++ dispatch loads the recreate thunk while
-			// the chain table holds something else, we have the mismatch that feeds the 75k/s storm.
-			// The caller address names the entry path (execInterrupt vs execJit).
-			if (f == &funcRecreate)
-			{
-				static thread_local int s_pr = 0;
-				if (s_pr < 20)
-				{
-					++s_pr;
-					std::fprintf(stderr, "[TR] execOneEnsureRun RECREATE pc=0x%06X chainTable=%p caller=%p\n",
-						_pc, m_jit.debugCurrentChainEntry(_pc), _ReturnAddress());
-				}
-			}
+			// PERF-133: the recreate-pingpong fprintf guard is gone from this per-block path (the hunt is
+			// closed; recreates are counted in the status line).
 
 			for (int retry = 0; retry < 16; ++retry)
 			{

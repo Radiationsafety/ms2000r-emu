@@ -624,6 +624,12 @@ void DSP56362Emulator::runForMcuCycles(uint32_t mcuCycles, uint32_t mcuHz)
     if (!m_dsp || !mcuHz) return;
     m_mcuCyclesRun += mcuCycles;
 
+    // PERF-133 measurement probe (default off): MS2K_SKIPDSP=1 runs everything UP TO the core exec -
+    // the machine gets no DSP service (no sound), but the MCU/pacing/audio-fill cost stays. The wall
+    // difference against the normal run is the DSP emulation's share of the CPU.
+    static const bool skipDsp = [] { const char* e = std::getenv("MS2K_SKIPDSP"); return e && *e == '1'; }();
+    if (skipDsp) { m_cycleTarget = m_dsp->getCycles(); return; }
+
     // MS2K_DSPDUMP="t:X:start:len,t:Y:start:len,..." (2026-09-25, R2 diagnostic, read-only): at MCU
     // time t, print that memory range, 8 words per line. For A/B comparisons of voice blocks.
     {
