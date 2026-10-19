@@ -6401,28 +6401,27 @@ void H8S2350Emulator::executeInstructionFast()
     }
     ++g_ms2kInsnIndex;
     const int history_idx = m_pc_history_idx;
-    {
-    m_dbg_last.prev    = m_dbg_last.start;
-    m_dbg_last.start   = insn.decoded_pc;
-    m_dbg_last.size    = insn.size;
-    m_dbg_last.primary = insn.opcode;
-    m_real_instruction_count++;
-    m_total_instruction_count++;
-    m_sp_modified_this_cycle = false;
-    m_r7_modified_this_cycle = false;
-    {
+    // PERF-MCU-14 (2026-10-19): four stores per instruction removed from this hot path.
+    //  - m_dbg_last: no reader anywhere (its dbgLast* accessors were never called) - deleted.
+    //  - m_real/total_instruction_count: only printVerificationStats() read them, nothing
+    //    ever called that - both deleted.
+    //  - the m_sp/m_r7_modified_this_cycle clears: their only readers sit in executeInstruction's
+    //    trace block, and m_trace forces the full path - so a fast-path clear can never be
+    //    observed. The full path still clears (6882) before the setters are read.
+    //  - the PC ring: MS2K_PCRING/MS2K_LOOPWATCH only (PERF-130's rule; the ODD-PC dump already
+    //    prints an ungated pcRingDump ring that defaults empty).
+    if (g_ms2kPcRing) {
         PcHistoryEntry& h = m_pc_history[history_idx];
         h.pc = pc0; h.opcode = 0; h.size = 0;
         m_pc_history_idx = (m_pc_history_idx + 1 == 10) ? 0 : m_pc_history_idx + 1;
     }
-    m_dbg_last.prev = m_dbg_last.start;
     if (g_ms2kOpHist) m_opcode_hit_count[op0]++;   // PERF-MCU-10: its only readers are MS2K_OPHIST / DIFFREF_HIST
-    }
     if (g_ms2kOpHist && m_decodeRaw) ++g_ms2kOp2Hist[uint32_t(op0) << 8 | m_decodeRaw[1]];   // PERF-MCU: 2-byte histogram
     if (g_ms2kOpCov) g_opCov.rec(pc0 & 0xFFFFFFu, m_decodeRaw, size);                      // AUDIT-3
     m_registers.pc = (pc0 + size) & 0x00FFFFFF;
     const uint64_t cyc0 = m_cycles;
-    m_busInExec = g_ms2kBusData != 0; m_busRecN = 0; m_busPc0 = pc0 & 0xFFFFFFu; m_busInsnSize = size;
+    m_busPc0 = pc0 & 0xFFFFFFu; m_busInsnSize = size;   // readByte()'s inline fetch window (PERF-MCU-11)
+    if (g_ms2kBusData) { m_busInExec = true; m_busRecN = 0; }   // PERF-MCU-14: every reader of these two is g_ms2kBusData-gated
     m_insnRaw = m_decodeRaw;
     m_insnRawOn = m_decodeRaw != nullptr && !g_fifoWatchOn && !g_pcmReadOn;
     uint32_t execCycles;
@@ -6448,11 +6447,11 @@ void H8S2350Emulator::executeInstructionFast()
     } else {
         execCycles = m_executor.execute(*this, insn, pc0).cycles;
     }
-    m_busInExec = false;
+    if (g_ms2kBusData) m_busInExec = false;   // PERF-MCU-14: only ever set above when g_ms2kBusData
     m_insnRawOn = false;
-    {
-    m_pc_history[history_idx].opcode = insn.opcode & 0xFFFF;
-    m_pc_history[history_idx].size = insn.size;
+    if (g_ms2kPcRing) {
+        m_pc_history[history_idx].opcode = insn.opcode & 0xFFFF;
+        m_pc_history[history_idx].size = insn.size;
     }
     const bool shiftGroup = insn.opcode >= 0x10 && insn.opcode <= 0x13;
     if (shiftGroup) m_registers.pc = (pc0 + size) & 0x00FFFFFF;
@@ -6847,7 +6846,8 @@ loopwatch_done:
     const H8S2350Instruction& insn = decodeCached(pc0);   // PERF-133: no per-instruction copy
     const uint8_t op0 = m_decodeOp0;   // BUG105: first byte, for fetchExtraStates() (PERF-135: kept by decodeCached)
     g_ms2kPhase = "pre-exec";
-    m_dbg_last.prev = m_dbg_last.start;
+    // PERF-MCU-14: the m_dbg_last writes and the real/total instruction counters that used to
+    // sit here and in executeInstructionFast are deleted - nothing ever read either.
     
     // INSTRUCTION SIZE VALIDATION: Assert decoded size is valid.
     //
@@ -6863,14 +6863,7 @@ loopwatch_done:
         return;
     }
     
-    // Update debug-last for tests
-    m_dbg_last.start   = insn.decoded_pc;
-    m_dbg_last.size    = insn.size;
-    m_dbg_last.primary = insn.opcode;
-    
-    // Verification: Count real instruction execution
-    m_real_instruction_count++;
-    m_total_instruction_count++;
+    // PERF-MCU-14: debug-last update and verification counters deleted (no readers).
     
     // 2) Default PC advance (hew3.txt: Apply 0x00FFFFFF mask to all PC operations)
     m_registers.pc = (pc0 + insn.size) & 0x00FFFFFF;
@@ -6937,7 +6930,7 @@ loopwatch_done:
         m_pc_history_idx = (m_pc_history_idx + 1 == 10) ? 0 : m_pc_history_idx + 1;
     }
     
-    m_dbg_last.prev = m_dbg_last.start;
+    // PERF-MCU-14: the m_dbg_last.prev write here is gone with the rest of m_dbg_last.
     // The executor doesn't have a success flag, so we track opcode hits directly
     m_opcode_hit_count[op0]++;   // PERF-MCU: by the first instruction byte (MS2K_OPHIST / DIFFREF_HIST)
     
@@ -13449,22 +13442,8 @@ void H8S2350Emulator::updateClockSystem()
     }
 }
 
-void H8S2350Emulator::printVerificationStats() const
-{
-    std::cout << "\n=== MS2000 H8S/2350 Instruction Engine Verification Stats ===" << std::endl;
-    std::cout << "Real Instructions Executed: " << m_real_instruction_count << std::endl;
-    std::cout << "Stub Instructions Executed: " << m_stub_instruction_count << std::endl;
-    std::cout << "Total Instructions Executed: " << m_total_instruction_count << std::endl;
-    std::cout << "Real Instruction Ratio: " << std::fixed << std::setprecision(2) 
-              << (getRealInstructionRatio() * 100.0) << "%" << std::endl;
-    
-    if (m_real_instruction_count > 0) {
-        std::cout << "✅ SUCCESS: Real GPT5 fw29.txt instruction engine is active!" << std::endl;
-    } else {
-        std::cout << "❌ WARNING: Only stub instructions detected - real engine not active!" << std::endl;
-    }
-    std::cout << "============================================================" << std::endl;
-}
+// PERF-MCU-14: printVerificationStats() deleted - nothing ever called it, and its counters
+// were the reason two 64-bit increments ran per instruction in the interpreter's hot path.
 
 // i15.txt MIDI IN/OUT - SCI RX injection for MIDI→FW pathway
 void H8S2350Emulator::sciInjectRxByte(int channel, uint8_t data)

@@ -321,16 +321,7 @@ public:
     H8S2350Emulator();
     ~H8S2350Emulator();
 
-    // Debug: expose last decoded instruction start/size/primary for tests
-    struct DebugLast { 
-        uint32_t start = 0; 
-        uint8_t size = 0; 
-        uint8_t primary = 0; 
-        uint32_t prev = 0;  // previous instruction start PC
-    };
-    uint32_t dbgLastStart()   const { return m_dbg_last.start; }
-    uint8_t  dbgLastSize()    const { return m_dbg_last.size; }
-    uint8_t  dbgLastPrimary() const { return m_dbg_last.primary; }
+    // PERF-MCU-14: DebugLast / dbgLast* deleted - write-only, no reader anywhere.
 
     // Stable, post-execute snapshot for tests (exact instruction that just ran)
     struct LastExec {
@@ -530,16 +521,10 @@ public:
     void setQuietBoot(bool enabled) { m_quietBoot = enabled; }
     bool isQuietBoot() const { return m_quietBoot; }
 
-    // Verification functions
-    uint64_t getRealInstructionCount() const { return m_real_instruction_count; }
-    uint64_t getStubInstructionCount() const { return m_stub_instruction_count; }
-    uint64_t getTotalInstructionCount() const { return m_total_instruction_count; }
-    double getRealInstructionRatio() const { 
-        return m_total_instruction_count > 0 ? 
-               (double)m_real_instruction_count / m_total_instruction_count : 0.0; 
-    }
-    void printVerificationStats() const;
-    
+    // PERF-MCU-14 (2026-10-19): the "verification" counters and printVerificationStats() are
+    // gone - nothing ever called the print or the getters, and the per-instruction increments
+    // sat in the interpreter's hot path.
+
     // State management
     void saveState(const std::string& filename);
     bool loadState(const std::string& filename);
@@ -1261,11 +1246,6 @@ private:
     H8S2350InstructionExecutor m_executor;
     bool m_trace = false;
     bool isVerboseTrace() const { return (m_trace || m_trace_cpu_always) && !m_quietBoot; }
-    
-    // Verification counters for real vs stub execution
-    uint64_t m_real_instruction_count = 0;
-    uint64_t m_stub_instruction_count = 0;
-    uint64_t m_total_instruction_count = 0;
     
     // Peripheral tick helper
     void tickPeripherals(uint32_t cycles);
@@ -2212,7 +2192,6 @@ public:
     void setStackCanaryEnforce(bool enforce) { m_canary_enforce = enforce; }
     bool isStackCanaryEnforced() const { return m_canary_enforce; }
 private:
-    DebugLast m_dbg_last;
     PcFuse m_pc_fuse;
     LastExec m_last_exec;
     bool m_canary_enforce = false; // Off by default to avoid Debug degradation
