@@ -529,7 +529,8 @@ namespace dsp56k
 	{
 		const auto& i = e.block->getInfo();
 
-		if(i.terminationReason == JitBlockInfo::TerminationReason::WritePMem)
+		// LIBS-3 (d81d7857): a loop that ends on a P-write block must get its write checked too
+		if(i.terminationReason == JitBlockInfo::TerminationReason::WritePMem || i.hasFlag(JitBlockInfo::Flags::WritesPMemAtLoopEnd))
 		{
 			if(i.hasFlag(JitBlockInfo::Flags::ModeChange))
 				return &funcRunCheckPMemWriteAndModeChange;
