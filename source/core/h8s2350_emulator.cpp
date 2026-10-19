@@ -61,6 +61,11 @@ uint64_t g_ms2kTickWhy[3] = {}, g_ms2kBudgetLog2[32] = {}, g_ms2kBudgetWhoN[32] 
 int g_ms2kBudgetWho = 0;
 static uint64_t g_ms2kOp2Hist[65536] = {};
 static const bool g_ms2kOpHist = [] { const char* e = std::getenv("MS2K_OPHIST"); return e && *e; }();
+// PERF-137: the same switch by SITE, not by opcode - which two or three addresses the machine spends
+// its instructions in. One array store per instruction while MS2K_OPHIST is set; 512 K slots covers
+// the flash window (index = pc >> 1) and the DRAM below it.
+static uint64_t* g_ms2kPcHist = g_ms2kOpHist ? new uint64_t[1u << 19] : nullptr;
+static void ms2kPcHit(uint32_t pc) { if (pc < (1u << 20)) ++g_ms2kPcHist[pc >> 1]; }
 // AUDIT-3 (2026-10-09, R2 diagnostic, default off): MS2K_OPCOV=<file> records every instruction SITE the
 // firmware executes (PC -> its bytes, first execution) and APPENDS "pc size bytes" lines to <file> at exit.
 // tools/diffref DIFFREF_SITES=<file> then replays exactly those encodings against the reference / oracle.
@@ -320,16 +325,22 @@ H8S2350Emulator::~H8S2350Emulator()
         printf("[OPHIST] batch ends: budget %llu, irq pending %llu, other event %llu; new budget log2:", (unsigned long long)g_ms2kTickWhy[0],
                (unsigned long long)g_ms2kTickWhy[1], (unsigned long long)g_ms2kTickWhy[2]);
         for (int b = 0; b < 32; ++b) if (g_ms2kBudgetLog2[b]) printf(" %d:%llu", b, (unsigned long long)g_ms2kBudgetLog2[b]);
-        // PERF-137: the same data by owner - which peripheral sets the deadline the next batch runs into.
-        static const char* const kBudgetWho[20] = { "none", "SCI1 RX", "SCI1 TX", "SCI0 TX", "ADC", "DMAC pace",
-                                                   "DSP FS", "TPU", "unbounded", "no deadline", "x", "SCI1 RX line",
-                                                   "x", "SCI0 TSR load", "x", "x", "DSP not batchable" };
-        uint64_t whoTot = 0;
-        for (int i = 0; i < 32; ++i) whoTot += g_ms2kBudgetWhoN[i];
-        printf("\n[BUDGETWHO]");
-        for (int i = 0; i < 20; ++i) if (g_ms2kBudgetWhoN[i]) printf(" %s %.1f %%, ", kBudgetWho[i],
-                                                                     100.0 * double(g_ms2kBudgetWhoN[i]) / double(whoTot ? whoTot : 1));
         printf("\n");
+        {   // PERF-137: the hottest sites, with the share they and everything above them add up to
+            std::vector<std::pair<uint64_t, uint32_t>> hot;
+            uint64_t hotTot = 0;
+            for (uint32_t i = 0; i < (1u << 19); ++i) if (g_ms2kPcHist[i]) { hot.push_back({g_ms2kPcHist[i], i * 2u}); hotTot += g_ms2kPcHist[i]; }
+            std::sort(hot.rbegin(), hot.rend());
+            printf("\n[PCHIST] %llu executed in the counted window, %zu sites:", (unsigned long long)hotTot, hot.size());
+            uint64_t run = 0;
+            for (size_t i = 0; i < hot.size() && i < 20; ++i) {
+                run += hot[i].first;
+                printf("\n[PCHIST] %06X %8.2f %% (%6.2f %% of all) - %llu visits", hot[i].second,
+                       100.0 * double(hot[i].first) / double(hotTot ? hotTot : 1), 100.0 * double(run) / double(tot ? tot : 1),
+                       (unsigned long long)hot[i].first);
+            }
+            printf("\n");
+        }
         {   // PERF-MCU: the first two bytes, top 60 (lean path only)
             std::vector<std::pair<uint64_t,int>> w; uint64_t t2 = 0;
             for (int i = 0; i < 65536; ++i) if (g_ms2kOp2Hist[i]) { w.push_back({g_ms2kOp2Hist[i], i}); t2 += g_ms2kOp2Hist[i]; }
@@ -6544,6 +6555,7 @@ void H8S2350Emulator::executeInstructionFast()
     }
     if (g_ms2kOpHist) m_opcode_hit_count[op0]++;   // PERF-MCU-10: its only readers are MS2K_OPHIST / DIFFREF_HIST
     if (g_ms2kOpHist && m_decodeRaw) ++g_ms2kOp2Hist[uint32_t(op0) << 8 | m_decodeRaw[1]];   // PERF-MCU: 2-byte histogram
+    if (g_ms2kOpHist) ms2kPcHit(pc0);   // PERF-137: which sites, not just which opcodes
     if (g_ms2kOpCov) g_opCov.rec(pc0 & 0xFFFFFFu, m_decodeRaw, size);                      // AUDIT-3
     m_registers.pc = (pc0 + size) & 0x00FFFFFF;
     const uint64_t cyc0 = m_cycles;
