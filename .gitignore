@@ -10,7 +10,10 @@ out/
 *.nvram
 *.pdf
 full FW/
+MS2000_Full_Firmware/
+*.syx
 thin_gui.ini
 dumps/
 *.wav
 *.log
+__cmake_systeminformation/

@@ -3,7 +3,11 @@
 #include <cstdint>
 #include <vector>
 #include <cstdio>
+#if defined(_MSC_VER)   // macOS SDKs ship no intrin.h
 #include <intrin.h>
+#else
+#define _ReturnAddress() __builtin_return_address(0)
+#endif
 
 #include "jitasmjithelpers.h"
 #include "jittypes.h"
@@ -49,16 +53,6 @@ namespace dsp56k
 				reinterpret_cast<void*>(m_funcExecOne),
 				reinterpret_cast<void*>(m_funcExecUntilCycles),
 				reinterpret_cast<void*>(&funcRecreate));
-
-			// 2026-10-13 hunt: hexdump the generated execUntilCycles dispatch - the ASM reads
-			// &funcRecreate from a cell the C++ reads as the block func; decode the real encoding.
-			{
-				const auto* p = reinterpret_cast<const unsigned char*>(m_funcExecUntilCycles);
-				std::fprintf(stderr, "[TRAMP] execUntilCycles bytes:");
-				for (size_t i = 0; i < 192; ++i)
-					std::fprintf(stderr, "%02X", p[i]);
-				std::fprintf(stderr, "\n");
-			}
 		}
 
 		void exec(DSP* _dsp, uint32_t _count) noexcept

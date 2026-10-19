@@ -34,11 +34,11 @@ bool validHome(const juce::File& d)
 {
     // BOOTROM-1: the public boot-362.bin is enough - the emulator corrects its two words in memory.
     // ROM-PATHS-1: beside flash.bin or in its "full FW" subfolder (rom_paths.h)
-    return ms2k::hasRoms(std::filesystem::path(d.getFullPathName().toWideCharPointer()));
+    return ms2k::hasRoms(std::filesystem::path(d.getFullPathName().toStdString()));
 }
 juce::String missingRoms(const juce::File& d)
 {
-    return juce::String(ms2k::missingRoms(std::filesystem::path(d.getFullPathName().toWideCharPointer())));
+    return juce::String(ms2k::missingRoms(std::filesystem::path(d.getFullPathName().toStdString())));
 }
 // HOME-1 (2026-10-01): the folder picked in Settings, kept for every instance and project
 juce::File homeSetting() { return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("MS2000R").getChildFile("home.txt"); }
