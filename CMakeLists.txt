@@ -20,7 +20,7 @@ if(APPLE)
     set(CMAKE_OBJCXX_VISIBILITY_PRESET hidden)
     set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 endif()
-add_compile_definitions(MS2K_VERSION="${PROJECT_VERSION}")   # PUBLIC-1b: shown in the GUI title and the plugin
+add_compile_definitions(MS2K_VERSION="${PROJECT_VERSION} - Spiralfractal edition")   # PUBLIC-1b: shown in the GUI title and the plugin
 
 # Enable testing support for CTest
 enable_testing()
