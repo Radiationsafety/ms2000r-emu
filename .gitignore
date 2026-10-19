@@ -16,4 +16,5 @@ thin_gui.ini
 dumps/
 *.wav
 *.log
+*.zip
 __cmake_systeminformation/
