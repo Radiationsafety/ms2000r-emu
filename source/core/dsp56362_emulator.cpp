@@ -139,16 +139,22 @@ void DSP56362Emulator::startThread()
         ms2kAudioWorkerThread();   // DSP-THREAD b: MMCSS Pro Audio, no power throttling
         for (;;) {
             const uint32_t d = m_qDone.load(std::memory_order_relaxed);
-            if (d != m_qHead.load(std::memory_order_acquire)) {
-                const DspReq r = m_q[d & (kQ - 1)];
-                runForMcuCycles(r.cycles, r.hz);
-                m_qDone.store(d + 1, std::memory_order_release);
+            const uint32_t h = m_qHead.load(std::memory_order_acquire);
+            if (d != h) {
+                // the whole backlog in one go: the done watermark moves once per batch, not per chunk -
+                // with syncMcu() every ~250 MCU instructions a per-chunk handoff is all wait, no work
+                for (uint32_t i = d; i != h; ++i) {
+                    const DspReq r = m_q[i & (kQ - 1)];
+                    runForMcuCycles(r.cycles, r.hz);
+                }
+                m_qDone.store(h, std::memory_order_release);
                 continue;
             }
             if (m_thrStop.load(std::memory_order_acquire)) break;
             // idle: spin a little (the next chunk is usually ~20 us of MCU time away), then sleep until posted
             bool got = false;
-            for (int i = 0; i < 400 && !got; ++i) { MS2K_CPU_RELAX(); got = m_qHead.load(std::memory_order_acquire) != d; }
+            static const int spinN = [] { const char* e = std::getenv("MS2K_DSPSPIN"); return e ? std::atoi(e) : 400; }();
+            for (int i = 0; i < spinN && !got; ++i) { MS2K_CPU_RELAX(); got = m_qHead.load(std::memory_order_acquire) != d; }
             if (got) continue;
             std::unique_lock<std::mutex> l(m_thrMx);
             m_thrSleeping.store(true, std::memory_order_release);
@@ -172,6 +178,8 @@ void DSP56362Emulator::stopThread()
 DSP56362Emulator::~DSP56362Emulator()
 {
     stopThread();
+    if (m_drainN) printf("[DSP56362] DRAINSTAT: %llu drains, avg %llu us, max %llu us\n",
+                         (unsigned long long)m_drainN, (unsigned long long)drainAvgUs(), (unsigned long long)m_drainMax);
     if (m_dsp) {
         printf("[DSP56362] end: %llu ESAI TX frames over %.3f s of MCU time, SHI words in %llu, RX overruns %llu\n",
                (unsigned long long)m_txFrames, double(m_mcuCyclesRun) / 10e6, (unsigned long long)m_wordsIn, (unsigned long long)m_shiOverruns);   // phi = 10 MHz

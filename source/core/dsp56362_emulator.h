@@ -120,9 +120,30 @@ public:
     void stopThread();
     bool threaded() const { return m_thr.joinable(); }
     void drain() {
+        // DSP-THREAD: the host's wait for the DSP thread. Yield from the first check: with a syncMcu() every
+        // few hundred MCU instructions, spinning both burns the host's real-time budget and fights the DSP
+        // thread for its core - measured on Apple Silicon (HostTest, 5 s audio, dspThread mode): pure spin
+        // 15.4 s wall, spin-2000-then-yield 6.5-6.9 s, yield 4.3 s. MS2K_DRAINYSPIN=1 restores the old spin.
+        static const bool drstat = [] { const char* e = std::getenv("MS2K_DRAINSTAT"); return e && *e == '1'; }();
+        static const bool dyspin = [] { const char* e = std::getenv("MS2K_DRAINYSPIN"); return e && *e == '1'; }();
+        const auto t0 = drstat ? std::chrono::steady_clock::now() : std::chrono::time_point<std::chrono::steady_clock>{};
         const uint32_t h = m_qHead.load(std::memory_order_relaxed);
-        while (m_qDone.load(std::memory_order_acquire) != h) MS2K_CPU_RELAX();
+        for (int i = 0; dyspin && i < 2000; ++i) {
+            if (m_qDone.load(std::memory_order_acquire) == h) { if (drstat) noteDrain(t0); return; }
+            MS2K_CPU_RELAX();
+        }
+        while (m_qDone.load(std::memory_order_acquire) != h) sched_yield();
+        if (drstat) noteDrain(t0);
     }
+  private:
+    void noteDrain(const std::chrono::steady_clock::time_point& t0) {
+        const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        m_drainN++; m_drainSum += us; if (us > m_drainMax) m_drainMax = us;
+    }
+  public:
+    uint64_t drainN() const { return m_drainN; }
+    uint64_t drainAvgUs() const { return m_drainN ? m_drainSum / m_drainN : 0; }
+    uint64_t drainMaxUs() const { return m_drainMax; }
     uint64_t m_syncCalls = 0, m_syncRuns = 0, m_fsRuns = 0;
     void flushPend() { if (m_pendMcu) { ++m_syncRuns; const uint32_t p = m_pendMcu; m_pendMcu = 0; post(p, m_pendHz); } }
     void post(uint32_t mcuCycles, uint32_t mcuHz) {
@@ -142,6 +163,7 @@ public:
     std::thread m_thr; std::atomic<bool> m_thrStop{ false }, m_thrSleeping{ false };
     std::mutex m_thrMx; std::condition_variable m_thrCv;
     uint64_t m_fsShadow = 0;   // DSP-THREAD study: how often the MCU must wait for the DSP
+    uint64_t m_drainN = 0, m_drainSum = 0, m_drainMax = 0;   // MS2K_DRAINSTAT: the host's drain() waits, us
 
     // DSP-RESET (2026-09-27): PORT_RESET = MCU P35 (KOD-A30411, R137 4.7k to GND) -> DSP RESET pin 44
     // (KOD-A30412). Low holds the DSP in reset (no execution, IRQB = FS2 AND PORT_RESET gated off);
