@@ -1129,17 +1129,23 @@ static const bool g_ms2kLegacyPeriph = ms2kAnyEnv({ "MS2K_LEGACYPERIPH" });
 // another measurement. Nested per-part timers were tried and abandoned: the parts are not a partition
 // (peripheralsSync() re-enters tickPeripheralsNow from the middle of a batch) and a 20 ns part cannot be
 // weighed with a 30 ns scale.
-// What dsp->tickMcu() costs is not timed either - MS2K_DSPTICK=0 skips that call, and the wall-clock
-// difference of the whole run says the same thing with no timer in the loop at all.
+// What dsp->tickMcu() costs is not timed either - MS2K_SKIPDSPCORE=<s> skips the core and keeps the
+// pacing, and the wall difference of the run says the same thing with no timer in the loop at all.
+// Calibration (MS2K_PFCALIB=1, which makes the tail bucket time two back-to-back clock reads): one
+// clock_gettime pair is 21 ns on this machine. So a bucket under ~30 ns is noise, not a measurement -
+// which is what the wait-state tail turned out to be (21.4 ns against a 21.2 ns floor: the bus model
+// costs a few ns, and the interpreter's ~50 ns per instruction is fetch, decode and execute).
 // Compiled out without -DMS2K_PHASEPROF, so a normal run pays nothing.
 #ifdef MS2K_PHASEPROF
-enum Ms2kPhaseBucket { kPfStep = 0, kPfTick, kPfN };
+enum Ms2kPhaseBucket { kPfStep = 0, kPfTick, kPfTail, kPfN };
 static const char* const kPfNames[kPfN] = { "a step: the instruction + the tick it made (if any)",
-                                            "a tickPeripherals() call, batched or not" };
+                                            "a tickPeripherals() call, batched or not",
+                                            "a step's wait-state model: the cycles the bus adds" };
 constexpr uint64_t kPfEveryInterp = 64, kPfEveryTick = 4;
 struct PhaseProfStats {
     uint64_t ns[kPfN] = {}, n[kPfN] = {};
     uint64_t cStep = 0, cTick = 0, cTickRan = 0;   // unconditional counters; cTickRan is bumped at each
+    bool drawnStep = false, drawnTick = false;     // the tail reads the step's draw, nothing nests further
 };                                               // tickPeripherals() site that really runs the peripherals
 PhaseProfStats g_ms2kPhaseProf;
 // One clock pair, drawn by the counter each object advances. The destructor also runs on the early
@@ -1147,6 +1153,7 @@ PhaseProfStats g_ms2kPhaseProf;
 struct PhaseProf {
     explicit PhaseProf(PhaseProfStats& s) : m_s(s) {
         m_sample = (++m_s.cStep % kPfEveryInterp) == 0;
+        s.drawnStep = m_sample;
         if (m_sample) m_t0 = ms2kPfNow();
     }
     ~PhaseProf() { if (m_sample) { m_s.ns[kPfStep] += ms2kPfNow() - m_t0; ++m_s.n[kPfStep]; } }
@@ -1169,7 +1176,7 @@ void ms2kPhaseProfReport(const PhaseProfStats& s)
     for (int b = 0; b < kPfN; ++b) {
         if (!s.n[b]) continue;
         printf("[PHASEPROF] %-48s %10.1f ns each  (%llu samples, 1 in %llu)\n", kPfNames[b],
-               double(s.ns[b]) / double(s.n[b]), u(s.n[b]), u(b == kPfStep ? kPfEveryInterp : kPfEveryTick));
+               double(s.ns[b]) / double(s.n[b]), u(s.n[b]), u(b == kPfTick ? kPfEveryTick : kPfEveryInterp));
     }
     if (s.n[kPfStep] && s.n[kPfTick]) {
         const double perStep = double(s.ns[kPfStep]) / double(s.n[kPfStep]);
@@ -1179,12 +1186,19 @@ void ms2kPhaseProfReport(const PhaseProfStats& s)
         printf("[PHASEPROF] per instruction: %.1f ns = %.1f ns tick (%.2f ticks/instr, %.1f %%) + %.1f ns interpreter\n",
                perStep, tickShare, ticksPerStep, 100.0 * tickShare / perStep, perStep - tickShare);
         printf("[PHASEPROF] one tick call costs %.1f ns = %.1f whole instructions\n", perTick, perTick / perStep);
+        if (s.n[kPfTail]) {
+            const double perTail = double(s.ns[kPfTail]) / double(s.n[kPfTail]);
+            printf("[PHASEPROF] the step: %.1f ns wait states + %.1f ns tick + %.1f ns fetch, decode, execute, bookkeeping\n",
+                   perTail, tickShare, perStep - perTail - tickShare);
+        }
     }
     fflush(stdout);
 }
-// MS2K_DSPTICK=0: the DSP's tickMcu() call is skipped, so the wall-clock difference of the run is what
-// that one call was worth - no timer around it, and no pacing (the DSP stops advancing; the render is
-// wrong by design, this is a measurement knob only).
+// MS2K_DSPTICK=0: the DSP's tickMcu() call is skipped. Measured with it, it is NOT a usable probe of
+// that call's cost: with the DSP never advanced, PEN is never seen, mcuBatchOk() stays false and the
+// MCU's batch collapses to one instruction per tick (0.108 -> 1.00 tick calls per instruction).
+// MS2K_SKIPDSPCORE=<s> in dsp56362_emulator.cpp is the version of this that keeps the batching.
+static const bool g_ms2kPfCalib = [] { const char* e = std::getenv("MS2K_PFCALIB"); return e && *e == '1'; }();
 static const bool g_ms2kPfDspTick = [] {
     const char* e = std::getenv("MS2K_DSPTICK");
     return !(e && *e == '0');
@@ -6570,6 +6584,11 @@ void H8S2350Emulator::executeInstructionFast()
     if (shiftGroup) m_registers.pc = (pc0 + size) & 0x00FFFFFF;
     m_last_store.valid = false;
     if (m_first_fault_detected) return;
+#ifdef MS2K_PHASEPROF
+    // PERF-137: the tail's clock opens here, past the shift-group PC fix and the store-invalidate that
+    // sit between the execution and the wait states.
+    const uint64_t ppTailT0 = g_ms2kPhaseProf.drawnStep ? ms2kPfNow() : 0;
+#endif
     uint32_t cycles = execCycles ? execCycles : insn.baseCycles;
     if (shiftGroup) cycles = uint32_t(m_cycles - cyc0);
     if (g_ms2kBusData) {                                 // == 2 here (1 takes the full path)
@@ -6593,6 +6612,18 @@ void H8S2350Emulator::executeInstructionFast()
         cycles += fetchExtraStates(pc0, size, op0);
     }
     m_cycles = cyc0;
+#ifdef MS2K_PHASEPROF
+    // PERF-137: the tail closes here. What is between its two clocks is the wait-state model of the
+    // instruction just executed and nothing else - the tick below is timed by its own clock pair, and
+    // the step's mean minus this one gives the rest without a third timer.
+    if (g_ms2kPhaseProf.drawnStep) {
+        // MS2K_PFCALIB=1: read the clock a second time and record that instead - the number printed is
+        // then one clock call's own cost, the bias every bucket here carries.
+        const uint64_t tA = ms2kPfNow();
+        g_ms2kPhaseProf.ns[kPfTail] += g_ms2kPfCalib ? (ms2kPfNow() - tA) : (tA - ppTailT0);
+        ++g_ms2kPhaseProf.n[kPfTail];
+    }
+#endif
     // PERF-MCU-9: tickPeripherals()' batching test in place (its body, and peripheralEventNow()'s, inline -
     // neither was inlined, 8 % of the MCU-only profile between them). Anything else: the call, which tests again.
     if (g_ms2kPeriphBatch && !m_peripheral && !g_ms2kOpHist && cycles < m_perBudget
