@@ -280,6 +280,124 @@ namespace dsp56k
 
 	void JitTrampoline::generateExecUntilCyclesFunc()
 	{
+#ifdef HAVE_ARM64
+		// MS2000 PERF-134: the x64 loop below, ported to ARM64. One trampoline entry for every block up to
+		// the DSP cycle target - the same body as generateExecLoopFunc's ARM64 iteration (inlined
+		// "peripheral due" test, hoisted pointers) with the counter replaced by cycles < target. It
+		// replaces the per-block C++ chain exec() -> execJit() -> execOneEnsureRun() -> execOne(): on
+		// Apple Silicon that round-trip dominated the small hot blocks (profiled: execUntilCycles inlined
+		// into runForMcuCycles 7%, MmuArray ensure 3%). x28 = the target, x29 = the live P size cell
+		// (execOneEnsureRun's out-of-window guard, read per block like the C++ does - the Memory object
+		// is the ctor's reference member and never rebinds), x23 (the exec loop's counter) = the cycles
+		// cell. All callee-saved, untouched by blocks and by C++ callees.
+		asmjit::CodeHolder codeHolder;
+		initCodeHolder(codeHolder);
+
+		JitEmitter m_asm(&codeHolder);
+
+		m_asm.addDiagnosticOptions(asmjit::DiagnosticOptions::kValidateIntermediate);
+		m_asm.addDiagnosticOptions(asmjit::DiagnosticOptions::kValidateAssembler);
+
+		constexpr auto g_targetCycles = JitReg64(28);
+		constexpr auto g_ptrSizeP = JitReg64(29);
+		static_assert(!g_targetCycles.equals(regDspPtr));
+		static_assert(!g_ptrSizeP.equals(regDspPtr));
+
+		m_asm.push(r64(g_ptrDSP));
+		m_asm.push(r64(g_counter));
+		m_asm.push(r64(regDspPtr));
+		m_asm.push(r64(g_ptrJitEntries));
+		m_asm.push(r64(g_ptrInterruptFunc));
+		m_asm.push(r64(g_ptrPC));
+		m_asm.push(r64(g_periphFunc));
+		m_asm.push(r64(g_ptrTargetClock));
+		m_asm.push(r64(g_ptrInstructions));
+		m_asm.push(r64(g_targetCycles));
+		m_asm.push(r64(g_ptrSizeP));
+		m_asm.push(asmjit::a64::regs::x30);
+
+		const auto argDspPtr = r64(g_funcArgGPs[0]);
+		const auto argTarget = r64(g_funcArgGPs[1]);
+
+		m_asm.mov(r64(g_ptrDSP), argDspPtr);
+		m_asm.mov(r64(g_targetCycles), argTarget);
+
+		m_asm.lea_(g_ptrJitEntries   , argDspPtr, &m_dsp.getJitEntries(), &m_dsp);
+		m_asm.lea_(g_ptrInterruptFunc, argDspPtr, &m_dsp.getInterruptFunc(), &m_dsp);
+		m_asm.lea_(g_ptrPC           , argDspPtr, &m_dsp.regs().pc.var, &m_dsp);
+		m_asm.lea_(g_counter         , argDspPtr, &m_dsp.getCycles(), &m_dsp);
+
+		const auto* const periphFunc = reinterpret_cast<const void*>(m_dsp.getExecPeripheralsFunc());
+		const auto* const targetClock = m_dsp.getPeriph(0)->getTargetClockPtr();
+
+		m_asm.mov(g_periphFunc, asmjit::Imm(periphFunc));
+		m_asm.mov(g_ptrTargetClock, asmjit::Imm(targetClock));
+		m_asm.mov(g_ptrInstructions, asmjit::Imm(&m_dsp.getInstructionCounter()));
+		m_asm.mov(r64(g_ptrSizeP), asmjit::Imm(m_dsp.memory().sizePtr(MemArea_P)));
+
+		const auto ptrDspRegs = Jitmem::makeRelativePtr(&m_dsp.regs(), &m_dsp, argDspPtr, 8);
+		assert(ptrDspRegs.offset());
+		m_asm.add(regDspPtr, g_ptrDSP, ptrDspRegs.offset());
+
+		const auto label = m_asm.newNamedLabel("beginExecUntilCycles");
+		const auto lExitPc = m_asm.newLabel();
+		m_asm.align(asmjit::AlignMode::kCode, 64);
+		m_asm.bind(label);
+
+		// 1) the interrupt func, with execPeriph()'s early-out inlined - as in the exec loop
+		const auto lCallInt = m_asm.newLabel();
+		const auto lSkipInt = m_asm.newLabel();
+
+		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_ptrInterruptFunc, 8));
+		m_asm.cmp(g_funcToCall, g_periphFunc);
+		m_asm.b(asmjit::arm::CondCode::kNE, lCallInt);
+		m_asm.ldr(r64(g_funcArgGPs[0]), Jitmem::makePtr(g_ptrTargetClock, 8));
+		m_asm.ldr(r64(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrInstructions, 8));
+		m_asm.cmp(r64(g_funcArgGPs[0]), r64(g_funcArgGPs[1]));
+		m_asm.b(asmjit::arm::CondCode::kHI, lSkipInt);
+		m_asm.bind(lCallInt);
+		m_asm.mov(g_funcArgGPs[0], g_ptrDSP);
+		m_asm.blr(g_funcToCall);
+		m_asm.bind(lSkipInt);
+
+		// 2) the block at the current PC; a pc outside the JIT-covered window must never index the table
+		// (the C++ guard in execOneEnsureRun) - exit the loop like the x64 version does.
+		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_ptrJitEntries, 8));
+		m_asm.ldr(r32(g_funcArgGPs[1]), Jitmem::makePtr(g_ptrPC, 4));
+		m_asm.ldr(r32(g_funcArgGPs[3]), Jitmem::makePtr(g_ptrSizeP, 4));
+		m_asm.cmp(r32(g_funcArgGPs[1]), r32(g_funcArgGPs[3]));
+		m_asm.b(asmjit::arm::CondCode::kHS, lExitPc);
+		m_asm.ldr(g_funcToCall, Jitmem::makePtr(g_funcToCall, g_funcArgGPs[1], 3, 8));
+		m_asm.mov(r64(g_funcArgGPs[0]), regDspPtr);
+		m_asm.blr(g_funcToCall);
+
+		// 3) again while cycles < target
+		m_asm.ldr(r64(g_funcToCall), Jitmem::makePtr(g_counter, 8));
+		m_asm.cmp(r64(g_funcToCall), r64(g_targetCycles));
+		m_asm.b(asmjit::arm::CondCode::kLO, label);
+
+		m_asm.bind(lExitPc);
+
+		m_asm.pop(asmjit::a64::regs::x30);
+		m_asm.pop(r64(g_ptrSizeP));
+		m_asm.pop(r64(g_targetCycles));
+		m_asm.pop(r64(g_ptrInstructions));
+		m_asm.pop(r64(g_ptrTargetClock));
+		m_asm.pop(r64(g_periphFunc));
+		m_asm.pop(r64(g_ptrPC));
+		m_asm.pop(r64(g_ptrInterruptFunc));
+		m_asm.pop(r64(g_ptrJitEntries));
+		m_asm.pop(r64(regDspPtr));
+		m_asm.pop(r64(g_counter));
+		m_asm.pop(r64(g_ptrDSP));
+
+		m_asm.ret();
+		m_asm.finalize();
+		m_runtime.add(&m_funcExecUntilCycles, &codeHolder);
+
+		if (auto* profiling = m_dsp.getJit().getProfilingSupport())
+			profiling->addFunction("trampolineExecUntilCycles", reinterpret_cast<void*>(m_funcExecUntilCycles), codeHolder);
+#else
 #ifdef HAVE_X86_64
 		asmjit::CodeHolder codeHolder;
 		initCodeHolder(codeHolder);
@@ -394,6 +512,7 @@ namespace dsp56k
 
 		if (auto* profiling = m_dsp.getJit().getProfilingSupport())
 			profiling->addFunction("trampolineExecUntilCycles", reinterpret_cast<void*>(m_funcExecUntilCycles), codeHolder);
+#endif
 #endif
 	}
 

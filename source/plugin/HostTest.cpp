@@ -25,6 +25,105 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <map>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#if !defined(_WIN32)
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <cxxabi.h>
+#include <csignal>
+#include <sys/time.h>
+#endif
+
+namespace {
+#if !defined(_WIN32)
+// PERF-133 PROF (macOS 27: sample/Instruments cannot attach - task_for_pid is denied to the terminal):
+// an in-process SIGPROF sampler. MS2K_PROF=<ms> - one sample per <ms> of CPU, backtrace() frames
+// collected without locks, symbolicated at exit. Prints the top-of-stack histogram and writes
+// /tmp/ms2k_prof.collapsed (root-first "a;b;c count" stacks) for deeper folding.
+struct ProfSampler {
+    static constexpr int kMax = 262144, kDepth = 24;
+    void* pc[kMax][kDepth];
+    uint16_t depth[kMax];
+    std::atomic<int> n { 0 };
+    int everyMs = 0;
+    static ProfSampler& me() { static ProfSampler s; return s; }
+    static void on(int) {
+        auto& s = me();
+        const int i = s.n.load(std::memory_order_relaxed);
+        if (i >= kMax) return;
+        // backtrace() here: [0]=ProfSampler::on, [1]=_sigtramp, [2..]=the interrupted stack - skip 2
+        void* raw[kDepth];
+        const int d = backtrace(raw, kDepth);
+        const int c = d > 2 ? d - 2 : 0;
+        for (int k = 0; k < c; ++k) s.pc[i][k] = raw[k + 2];
+        s.depth[i] = uint16_t(c);
+        s.n.store(i + 1, std::memory_order_relaxed);
+    }
+    ~ProfSampler() {
+        if (!everyMs) return;
+        itimerval z{}; setitimer(ITIMER_PROF, &z, nullptr);
+        const int tot = n.load();
+        if (!tot) { std::fprintf(stderr, "[PROF] no samples\n"); return; }
+        auto symFor = [&](void* addr) -> std::string {
+            Dl_info di;
+            if (dladdr(addr, &di) && di.dli_sname) {
+                std::string mod = di.dli_fname;
+                const auto slash = mod.rfind('/');
+                if (slash != std::string::npos) mod = mod.substr(slash + 1);
+                char* dm = nullptr;
+                if (char* d = abi::__cxa_demangle(di.dli_sname, nullptr, nullptr, nullptr)) dm = d;
+                std::string sym = dm ? dm : di.dli_sname;
+                std::free(dm);
+                return mod + " " + sym;
+            }
+            char** s = backtrace_symbols(&addr, 1);
+            std::string r = s ? s[0] : "??";
+            if (s) std::free(s);
+            return "raw[" + r + "]";
+        };
+        for (int i = 0; i < 3 && i < tot; ++i) {   // debug: first stacks as collected
+            std::fprintf(stderr, "[PROFDBG] #%d depth=%d", i, depth[i]);
+            for (int d = 0; d < depth[i] && d < 8; ++d) std::fprintf(stderr, " | %s", symFor(pc[i][d]).c_str());
+            std::fprintf(stderr, "\n");
+        }
+        std::map<std::string, int> self;
+        for (int i = 0; i < tot; ++i) if (depth[i] > 0) self[symFor(pc[i][0])]++;
+        std::vector<std::pair<int, std::string>> v;
+        v.reserve(self.size());
+        for (auto& kv : self) v.push_back({kv.second, kv.first});
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::fprintf(stderr, "\n[PROF] %d CPU samples, self by top-of-stack:\n", tot);
+        for (size_t i = 0; i < v.size() && i < 25; ++i)
+            std::fprintf(stderr, "[PROF] %5.1f%% %s\n", 100.0 * v[i].first / tot, v[i].second.c_str());
+        std::map<std::string, int> agg;
+        for (int i = 0; i < tot; ++i) {
+            std::string s;
+            for (int d = depth[i] - 1; d >= 0; --d) { if (!s.empty()) s += ";"; s += symFor(pc[i][d]); }
+            agg[s]++;
+        }
+        if (FILE* f = std::fopen("/tmp/ms2k_prof.collapsed", "w")) {
+            for (auto& kv : agg) std::fprintf(f, "%s %d\n", kv.first.c_str(), kv.second);
+            std::fclose(f);
+        }
+    }
+};
+struct ProfStart {
+    ProfStart() {
+        const char* e = std::getenv("MS2K_PROF");
+        if (!e) return;
+        auto& s = ProfSampler::me();
+        s.everyMs = std::max(1, std::atoi(e));
+        struct sigaction sa{}; sa.sa_handler = ProfSampler::on; sigaction(SIGPROF, &sa, nullptr);
+        itimerval t{}; t.it_interval.tv_usec = t.it_value.tv_usec = s.everyMs * 1000;
+        setitimer(ITIMER_PROF, &t, nullptr);
+    }
+} g_profStart;
+#endif
+}
 
 namespace {
 std::vector<double> g_blockMs;   // PERF-VST: the time of every processBlock call

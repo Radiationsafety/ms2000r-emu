@@ -244,7 +244,9 @@ namespace dsp56k
 		{
 			if(m_cycles >= _targetCycles)
 				return;
-			if(g_useJIT && m_jit.getTrampoline().hasExecUntilCycles())
+			// MS2000 PERF-134 A/B: MS2K_NOJITLOOP=1 forces the per-block C++ chain (measurement only)
+			static const bool noJitLoop = [] { const char* e = std::getenv("MS2K_NOJITLOOP"); return e && *e == '1'; }();
+			if(g_useJIT && !noJitLoop && m_jit.getTrampoline().hasExecUntilCycles())
 			{
 				m_jit.getTrampoline().execUntilCycles(this, _targetCycles);
 				return;

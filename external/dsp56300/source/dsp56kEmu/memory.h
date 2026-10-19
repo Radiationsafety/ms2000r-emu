@@ -117,6 +117,10 @@ namespace dsp56k
 		TWord				sizeXY				() const				{ return size(MemArea_X); }
 		TWord				sizeP				() const				{ return size(MemArea_P); }
 
+		// MS2000 PERF-134: the address of the live size cell - the ARM64 execUntilCycles trampoline reads
+		// the window guard from here instead of baking the value, so the check matches the C++ path.
+		TWord*				sizePtr				(EMemArea _area)		{ return &m_size[_area]; }
+
 		void				setExternalMemory	(const TWord _address, bool _isExternalMemoryBridged)
 		{
 			m_bridgedMemoryAddress = _isExternalMemoryBridged ? _address : 0;
