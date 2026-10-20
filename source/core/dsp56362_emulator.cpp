@@ -40,6 +40,43 @@ void dumpDspRing()
         (unsigned long long)g_ringShi->hrxEmptyReads(), g_ringShi->rxCount(), g_ringShi->rxMaxFill());
     fflush(stdout);
 }
+
+// RE-1 (MS2K_DSPCAP=<file>, default off): lossless record of the SHI word stream - the DSP program and the
+// wavedata reach the DSP only as this stream (the firmware streams it out of flash.bin over SCI0/SPI), so this
+// tap, not any file, is the image's real source. One 32-byte record per assembled word, little endian:
+// { u64 mcuCycles, u64 dspCycles, u32 mosi24, u32 miso24, u32 flags, u32 hcsrBefore }.
+// flags bit0 = the word was taken (RX FIFO not full), bit1 = the MISO word was stale at latch time.
+// Header: "MS2KSHI1" + u32 recordSize + u32 version. Host I/O only while the env var is set.
+struct ShiCap
+{
+    FILE* f = nullptr;
+    bool enabled = false;
+    ShiCap()
+    {
+        const char* path = std::getenv("MS2K_DSPCAP");
+        if (!path || !*path) return;
+        f = std::fopen(path, "wb");
+        if (!f) { printf("[SHI-CAP] cannot open %s\n", path); return; }
+        enabled = true;
+        const unsigned char magic[8] = { 'M','S','2','K','S','H','I','1' };
+        std::fwrite(magic, 1, 8, f);
+        const uint32_t recSize = 32, ver = 1;
+        std::fwrite(&recSize, 4, 1, f);
+        std::fwrite(&ver, 4, 1, f);
+        printf("[SHI-CAP] recording words to %s\n", path);
+    }
+    ~ShiCap() { if (f) std::fclose(f); }
+    void word(uint64_t mcu, uint64_t dspc, uint32_t mosi24, uint32_t miso24, bool accepted, bool stale, uint32_t hcsr)
+    {
+        if (!enabled || !f) return;
+        uint64_t t[2] = { mcu, dspc };
+        uint32_t w[4] = { mosi24 & 0xFFFFFFu, miso24 & 0xFFFFFFu,
+                          (accepted ? 1u : 0u) | (stale ? 2u : 0u), hcsr };
+        std::fwrite(t, 8, 2, f);
+        std::fwrite(w, 4, 4, f);
+    }
+};
+ShiCap g_shiCap;
 }
 
 namespace MS2000 {
@@ -656,6 +693,84 @@ void DSP56362Emulator::runForMcuCycles(uint32_t mcuCycles, uint32_t mcuHz)
         }
     }
 
+    // RE-2 (MS2K_DSPSNAP=<dir>, default off): dump the DSP program and the wavedata once they have
+    // landed. They have no file: the firmware streams 24-bit words over the SHI (RE-1 taps that
+    // stream) and Motorola's boot ROM writes P itself, so the authoritative image is what sits in
+    // the DSP's own memory when the stream goes quiet: >=50 ms with no new SHI words, then two FNV
+    // hashes of P:[0..0x10000) and Y:[0x490000..0x4C0000) taken >=50 ms apart must agree. Writes
+    // <dir>/p_prog.raw, y_wave.raw, x_data.raw (3 bytes/word big endian - the input format of the
+    // dsp56300 'disassemble' tool), p_prog.s (the library's saveAssembly) and manifest.txt.
+    // The captured bytes stay in <dir>; nothing derived from them is committed.
+    {
+        static const char* snapDir = [] { const char* e = std::getenv("MS2K_DSPSNAP"); return (e && *e) ? e : (const char*)nullptr; }();
+        if (snapDir)
+        {
+            static bool snapDone = false;
+            static uint64_t lastWords = ~0ull, quietSince = 0;
+            static uint64_t hP1 = 0, hY1 = 0, hashAt = ~0ull, wordsAtHash = 0;
+            if (!snapDone)
+            {
+                const uint64_t mcu = m_mcuCyclesRun;              // 10 MHz -> 500000 cycles = 50 ms
+                if (m_wordsIn != lastWords) { lastWords = m_wordsIn; quietSince = mcu; hashAt = ~0ull; }
+                // The quiet clock only starts once the upload has visibly flowed (the whole program is
+                // ~130 K words): at power-on the line is quiet too, and that is not a completed upload.
+                const bool flowed = m_wordsIn >= 20000;
+                auto fnv = [&](EMemArea ar, TWord a0, TWord n) {
+                    uint64_t h = 1469598103934665603ull;
+                    for (TWord i = 0; i < n; ++i) {
+                        const uint32_t w = uint32_t(m_mem->get(ar, a0 + i)) & 0xFFFFFFu;
+                        h = (h ^ (w >> 16)) * 1099511628211ull; h = (h ^ (w >> 8)) * 1099511628211ull;
+                        h = (h ^ (w & 0xFFu)) * 1099511628211ull; }
+                    return h; };
+                if (flowed && mcu >= quietSince + 500000 && hashAt == ~0ull) {        // first hash of the quiet pair
+                    hP1 = fnv(MemArea_P, 0, 0x10000); hY1 = fnv(MemArea_Y, 0x490000, 0x30000);
+                    hashAt = mcu; wordsAtHash = m_wordsIn; }
+                else if (hashAt != ~0ull && mcu >= hashAt + 500000) {       // second hash: still stable?
+                    const uint64_t hP2 = fnv(MemArea_P, 0, 0x10000), hY2 = fnv(MemArea_Y, 0x490000, 0x30000);
+                    if (hP2 == hP1 && hY2 == hY1)
+                    {
+                        snapDone = true;
+                        auto dumpRaw = [&](const char* name, EMemArea ar, TWord a0, TWord n) -> bool {
+                            char path[1024]; std::snprintf(path, sizeof path, "%s/%s", snapDir, name);
+                            FILE* f = std::fopen(path, "wb"); if (!f) return false;
+                            for (TWord i = 0; i < n; ++i) {
+                                const uint32_t w = uint32_t(m_mem->get(ar, a0 + i)) & 0xFFFFFFu;
+                                const unsigned char b[3] = { static_cast<unsigned char>((w >> 16) & 0xFF),
+                                                             static_cast<unsigned char>((w >> 8) & 0xFF),
+                                                             static_cast<unsigned char>(w & 0xFF) };
+                                std::fwrite(b, 1, 3, f); }
+                            std::fclose(f); return true; };
+                        const bool okP = dumpRaw("p_prog.raw", MemArea_P, 0, 0x10000);
+                        const bool okY = dumpRaw("y_wave.raw", MemArea_Y, 0x490000, 0x30000);
+                        const bool okX = dumpRaw("x_data.raw", MemArea_X, 0, 0x10000);
+                        char asmPath[1024]; std::snprintf(asmPath, sizeof asmPath, "%s/p_prog.s", snapDir);
+                        const bool okS = m_mem->saveAssembly(asmPath, 0, 0x10000, false, false, m_periphX.get(), nullptr);
+                        char manPath[1024]; std::snprintf(manPath, sizeof manPath, "%s/manifest.txt", snapDir);
+                        if (FILE* mf = std::fopen(manPath, "wb")) {
+                            std::fprintf(mf, "# DSP image snapshot - build %s %s\n"
+                               "quietStart.mcuCycles %llu\nquietStart.wordsIn %llu\n"
+                               "hash1.mcuCycles %llu hash2.mcuCycles %llu hash2.wordsIn %llu\n"
+                               "hashP %016llX hashY %016llX\n"
+                               "range.P 000000-FFFFF range.Y 490000-4BFFFF range.X 000000-FFFFF\n"
+                               "dump.p_prog.raw %d dump.y_wave.raw %d dump.x_data.raw %d listing.p_prog.s %d\n",
+                               __DATE__, __TIME__,
+                               (unsigned long long)(quietSince + 500000), (unsigned long long)wordsAtHash,
+                               (unsigned long long)hashAt, (unsigned long long)mcu, (unsigned long long)m_wordsIn,
+                               (unsigned long long)hP1, (unsigned long long)hY1,
+                               int(okP), int(okY), int(okX), int(okS));
+                            std::fclose(mf); }
+                        printf("[DSPSNAP] upload complete at MCU t=%.3f s: SHI quiet %llu ms, P+Y stable over two hashes, "
+                               "words in %llu -> %s (p %d y %d x %d asm %d)\n",
+                               double(mcu) / 10e6, (unsigned long long)((mcu - quietSince) / 10000),
+                               (unsigned long long)m_wordsIn, snapDir, int(okP), int(okY), int(okX), int(okS));
+                        fflush(stdout);
+                    }
+                    else { hP1 = hP2; hY1 = hY2; hashAt = mcu; wordsAtHash = m_wordsIn; }   // re-pair, keep waiting
+                }
+            }
+        }
+    }
+
     // MS2K_DSPMEMCENSUS=<MCU s> (2026-09-25, R2 diagnostic, read-only): once, at that time, the
     // number of non-zero words per 64 K block in X, Y and P, and the Port A registers (AAR0-3,
     // DCR) as the program left them. Question: where did the 0x70 wave upload land, and in
@@ -1176,7 +1291,9 @@ uint8_t DSP56362Emulator::spiByte(uint8_t mosi, bool ssAsserted)
         // is counted, the first few logged with the DSP PC and the MCU time.
         const TWord rxBefore = shi.read(SHI::HCSR);
         shi.exchange(m_inWord & ((1u << (8 * bytesPerWord)) - 1u));
-        if ((rxBefore >> 19) & 1) {                   // HRFF was set: this word was discarded
+        const bool rxFull = ((rxBefore >> 19) & 1) != 0;      // HRFF before the exchange: the word is discarded
+        g_shiCap.word(m_mcuCyclesRun, m_dsp->getCycles(), m_inWord, m_outWord, !rxFull, !m_outFresh, rxBefore);
+        if (rxFull) {                                         // HRFF was set: this word was discarded
             ++m_shiOverruns;
             if (m_shiOverruns == 1 && g_dspRingOn) dumpDspRing();   // VOCODER-1: what the DSP ran before the first loss
             if (m_shiOverruns <= 8)
