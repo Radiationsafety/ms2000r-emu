@@ -18,3 +18,5 @@ dumps/
 *.log
 *.zip
 __cmake_systeminformation/
+.qoder/settings.local.json
+.mypy_cache/
