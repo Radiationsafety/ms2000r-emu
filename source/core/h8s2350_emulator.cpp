@@ -11655,16 +11655,26 @@ void H8S2350Emulator::clearBreakpoint(uint32_t address)
 
 std::string H8S2350Emulator::getDisassembly(uint32_t address, size_t count)
 {
+    // RE-3: real linears, through the same decoder the machine executes with. size is the byte
+    // length in the production path (see decodeCached); an undecodable site stays one byte wide,
+    // so the walk always makes progress.
     std::stringstream ss;
-    ss << "Disassembly at 0x" << std::hex << address << " (" << count << " instructions):" << std::endl;
-    
+    ss << "Disassembly at 0x" << std::hex << address << " (" << std::dec << count << " instructions):" << std::endl;
+    uint32_t pc = address;
     for (size_t i = 0; i < count; i++) {
-        uint16_t instruction = readWord(address + i * 2); // Assuming 16-bit instructions
-        ss << "0x" << std::hex << std::setw(4) << std::setfill('0') << (address + i * 2) 
-           << ": 0x" << std::hex << std::setw(4) << std::setfill('0') << instruction 
-           << " [TODO: decode instruction]" << std::endl;
+        const H8S2350Instruction insn = m_decoder.decode(*this, pc);
+        uint8_t size = insn.size;
+        if (size < 2 || size > 10) size = 2;
+        ss << "0x" << std::hex << std::setw(6) << std::setfill('0') << pc << ": ";
+        for (uint8_t b = 0; b < size; ++b)
+            ss << std::hex << std::setw(2) << std::setfill('0') << int(readByte(pc + b)) << " ";
+        const std::string& mn = insn.mnemonic.empty() ? std::string("???") : insn.mnemonic;
+        ss << std::dec << "  " << mn << "  ; op=" << std::hex << std::setw(2) << std::setfill('0')
+           << int(insn.opcode) << " am=" << int(insn.addressing_mode)
+           << " s=" << int(insn.source_operand) << " d=" << int(insn.destination_operand)
+           << " imm=" << insn.immediate_value << " disp=" << insn.displacement << std::dec << std::endl;
+        pc = pcMask24(pc + size);
     }
-    
     return ss.str();
 }
 

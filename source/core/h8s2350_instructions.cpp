@@ -91,7 +91,8 @@ namespace MS2000
     // ==== Instruction Decoder Implementation ====
     
     // fw29.txt GPT5 PC-based decode method (memory context access)
-    H8S2350Instruction H8S2350InstructionDecoder::decode(H8S2350Emulator& emulator, uint32_t pc)
+    template <class Bus>
+    H8S2350Instruction H8S2350InstructionDecoder::decode(Bus& emulator, uint32_t pc)
     {
         H8S2350Instruction instr;
         instr.decoded_pc = pc;
@@ -123,8 +124,8 @@ namespace MS2000
                                      | emulator.readByte(pc + 3));
             instr.immediate_value = (uint16_t)disp;
             static const char* ccname[16] = {
-                "","","","","","","","",
-                "","","","", "", "","",""
+                "BRA","BRN","BHI","BLS","BCC","BCS","BNE","BEQ",
+                "BVC","BVS","BPL","BMI","BGE","BLT","BGT","BLE"
             };
             instr.mnemonic = ccname[cc];
             return instr;
@@ -1997,13 +1998,17 @@ namespace MS2000
         instr = decode(firstWord);
 
         // Enhanced size calculation with memory context
-        instr.size = calculateInstructionSize(emulator, pc, firstWord);
+        instr.size = calculateInstructionSize(pc, firstWord);
 
         // Set base cycles based on instruction complexity
         instr.baseCycles = calculateBaseCycles(instr.opcode, instr.addressing_mode);
         
         // Diagnostic dump for UNKNOWN opcodes to prioritize next implementation
-        if (instr.mnemonic == "UNKNOWN" || instr.mnemonic.find("UNKNOWN") != std::string::npos) {
+        // (RE-3: gated by the bus' quiet flag - the same channel as [DEBUG-DECODER-START] above, so
+        // a static sweep over a whole ROM stays silent; the machine still prints when it is not
+        // booting quietly.)
+        if (!emulator.isQuietBoot() &&
+            (instr.mnemonic == "UNKNOWN" || instr.mnemonic.find("UNKNOWN") != std::string::npos)) {
             const uint8_t b0 = emulator.readByte(pc);
             const uint8_t b1 = emulator.readByte(pc + 1);  
             const uint8_t b2 = emulator.readByte(pc + 2);
@@ -2013,7 +2018,11 @@ namespace MS2000
         
         return instr;
     }
-    
+
+    // RE-3: the two bus types the decoder is used with (see the header).
+    template H8S2350Instruction H8S2350InstructionDecoder::decode<H8S2350Emulator>(H8S2350Emulator&, uint32_t);
+    template H8S2350Instruction H8S2350InstructionDecoder::decode<StaticByteSource>(StaticByteSource&, uint32_t);
+
     // Legacy decoder (compatibility)
     H8S2350Instruction H8S2350InstructionDecoder::decode(uint16_t instruction)
     {
@@ -5645,8 +5654,9 @@ namespace MS2000
     }
 
     // GPT5 fw29.txt helper methods implementation
-    uint8_t H8S2350InstructionDecoder::calculateInstructionSize(H8S2350Emulator& emulator, uint32_t pc, uint16_t instruction)
+    uint8_t H8S2350InstructionDecoder::calculateInstructionSize(uint32_t pc, uint16_t instruction)
     {
+        (void)pc;
         // Basic size calculation - can be enhanced based on addressing modes
         uint8_t opcode = extractOpcode(instruction);
         uint8_t addressing_mode = extractAddressingMode(instruction);

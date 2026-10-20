@@ -339,11 +339,11 @@ else()
 endif()
 message(STATUS "MS2000 Main Emulator will be built")
 
-# DISABLED: Only build ms2000_emulator.exe as requested
-# 2. Firmware analyzer tool - DISABLED
-# add_executable(firmware_analyzer source/standalone/firmware_analyzer.cpp)
-# target_link_libraries(firmware_analyzer ms2000)
-# message(STATUS "Firmware Analyzer tool will be built")
+# RE-3: firmware analyzer, rebuilt EXCLUDE_FROM_ALL (it is not the emulator; build with
+# cmake --build <dir> --target firmware_analyzer when you want it). Analyses the user's OWN dump.
+add_executable(firmware_analyzer EXCLUDE_FROM_ALL source/standalone/firmware_analyzer.cpp)
+target_include_directories(firmware_analyzer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
+target_link_libraries(firmware_analyzer ms2000)
 
 # 3. Simple test application - DISABLED
 # add_executable(ms2000_test source/standalone/minimal_test.cpp)
@@ -427,11 +427,10 @@ install(FILES
 # target_link_libraries(ms2000_main ms2000)
 # message(STATUS "MS2000 Headless Main will be built")
 
-# DISABLED: Only build ms2000_emulator.exe as requested
-# 7. ROM vector table scanner for TRAPA debugging - DISABLED
-# add_executable(rom_vector_scan source/standalone/rom_vector_scan.cpp)
-# target_link_libraries(rom_vector_scan ms2000)
-# message(STATUS "ROM Vector Scanner will be built")
+# RE-3: ROM vector table scanner for TRAPA debugging, rebuilt EXCLUDE_FROM_ALL (user's own dump).
+add_executable(rom_vector_scan EXCLUDE_FROM_ALL source/standalone/rom_vector_scan.cpp)
+target_include_directories(rom_vector_scan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
+target_link_libraries(rom_vector_scan ms2000)
 
 # 8. Vector Table Tracker integration test - DISABLED
 # add_executable(vector_tracker_test vector_tracker_test.cpp)
@@ -755,6 +754,17 @@ endforeach()
 add_executable(dsp_bootrom_probe tools/dsp_bootrom_probe.cpp)
 target_include_directories(dsp_bootrom_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/dsp56300/source/dsp56kEmu ${CMAKE_CURRENT_SOURCE_DIR}/external/dsp56300/source)
 target_link_libraries(dsp_bootrom_probe PRIVATE dsp56kEmu)
+
+# RE-3 (2026-10-20): offline H8S/2350 analysis of a flash dump - linear disassembly, the vector
+# table and the MS2K_OPCOV coverage cross-check, all through the emulator's own decoder. Like
+# diffref, it analyses the user's OWN dump; its output goes to the gitignored dumps/ folder and
+# is never committed.
+add_executable(h8sdis tools/h8sdis/h8sdis.cpp)
+target_include_directories(h8sdis PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
+target_link_libraries(h8sdis ms2000)
+if(MSVC)
+  target_link_options(h8sdis PRIVATE /STACK:8388608)
+endif()
 
 # DIFFREF (2026-09-25): LOCAL-ONLY instruction-level differential test against the
 # UKNTCH2000 reference H8S core. The reference source is never copied into this repo;

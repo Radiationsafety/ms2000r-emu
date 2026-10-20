@@ -299,12 +299,25 @@ namespace MS2000
     // Forward declaration
     class H8S2350Emulator;
 
+    // RE-3: a flat byte window (a ROM image in memory) that offers the two bus calls the PC-based
+    // decoder makes, so a static disassembly needs no emulator. Reads outside the window are 0xFF,
+    // as an unmapped bus read is.
+    struct StaticByteSource
+    {
+        const uint8_t* data = nullptr;
+        uint32_t size = 0;
+        uint8_t readByte(uint32_t addr) const { return addr < size ? data[addr] : 0xFF; }
+        bool isQuietBoot() const { return true; }
+    };
+
     // Instruction decoder (fw29.txt GPT5 design - PC + memory context)
     class H8S2350InstructionDecoder
     {
     public:
-        // New PC-based decode method (GPT5 recommended)
-        H8S2350Instruction decode(H8S2350Emulator& emulator, uint32_t pc);
+        // New PC-based decode method (GPT5 recommended). Bus = anything with readByte(addr) and
+        // isQuietBoot(): H8S2350Emulator in the machine, StaticByteSource for offline disassembly.
+        template <class Bus>
+        H8S2350Instruction decode(Bus& emulator, uint32_t pc);
         
         // Legacy methods (compatibility)
         static H8S2350Instruction decode(uint16_t instruction);
@@ -319,7 +332,7 @@ namespace MS2000
         static uint8_t extractDestinationOperand(uint16_t instruction);
         
         // GPT5 fw29.txt helper methods
-        static uint8_t calculateInstructionSize(H8S2350Emulator& emulator, uint32_t pc, uint16_t instruction);
+        static uint8_t calculateInstructionSize(uint32_t pc, uint16_t instruction);
         static uint32_t calculateBaseCycles(uint8_t opcode, uint8_t addressing_mode);
     };
     
