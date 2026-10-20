@@ -18,6 +18,8 @@
 #include <unordered_map>  // For stack taint tracking
 #include <mutex>          // BUG108: MIDI IN from the host thread
 #include <deque>
+#include <cassert>
+#include "h8sjit/mcu_jit.h"   // JIT-0 (MS2K_MCUJIT): the MCU JIT block store
 #include <atomic>         // GUI-2: panel switches from the GUI thread
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>  // Add SIMD support
@@ -1229,6 +1231,11 @@ private:
     std::vector<uint32_t> m_dramPageGen;
     std::vector<uint8_t>  m_dramCodePage;
     uint32_t m_dcacheGen = 1;
+    // JIT-0 (2026-10-20, MS2K_MCUJIT): m_jitGen is bumped at EVERY m_dcacheGen site; the assert
+    // keeps them in lockstep, so a JIT block is invalidated exactly when a decode-cache entry is.
+    // Blocks are keyed (pc, m_jitGen, m_dramPageGen[page]) - the same key as DecodeCacheEntry.
+    uint32_t m_jitGen = 1;
+    std::unique_ptr<ms2k::mcujit::McuJit> m_mcuJit;   // null unless MS2K_MCUJIT (built in ctor)
     // Returns a reference that stays valid until the next decodeCached() call (the executor gets
     // it as the const& it always took; nothing decodes again while an instruction executes).
     const H8S2350Instruction& decodeCached(uint32_t pc);
@@ -1241,7 +1248,7 @@ private:
         if (pg < DRAM_PAGES && !m_dramCodePage.empty() && m_dramCodePage[pg]) { ++m_dramPageGen[pg]; if (pg) ++m_dramPageGen[pg - 1]; m_insnRawOn = false; }
     }
 public:
-    void invalidateDecodeCache() { ++m_dcacheGen; m_insnRawOn = false; }   // PERF-133: host-side changes to code memory
+    void invalidateDecodeCache() { ++m_dcacheGen; ++m_jitGen; assert(m_jitGen == m_dcacheGen); m_insnRawOn = false; }   // PERF-133: host-side changes to code memory
 private:
     H8S2350InstructionExecutor m_executor;
     bool m_trace = false;
@@ -2033,6 +2040,10 @@ private:
     // Instruction execution
     void executeInstruction();
     void executeInstructionFast();   // PERF-MCU-2
+    void executeInstructionFastBody();   // JIT-0: the fast path minus its entry gate - what a JIT block runs back
+public:
+    void mcuJitExecOne() { executeInstructionFastBody(); }   // JIT-0: the thunk's entry point (one instruction)
+private:
     bool m_spUnderflowReported = false;
     void handleInterrupt(H8S2350Interrupt interrupt);
     void updateFlags();

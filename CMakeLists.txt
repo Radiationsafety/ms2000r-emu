@@ -96,6 +96,7 @@ set(MS2000_SOURCES
     source/core/thread_prio_win.cpp
     source/core/h8s2350_emulator.cpp
     source/core/h8s2350_instructions.cpp
+    source/core/h8sjit/mcu_jit.cpp
     source/core/sampling_profiler.cpp
     source/core/h8s2350_interrupt_system.cpp
     source/core/h8s2350_peripherals.cpp
@@ -156,6 +157,7 @@ set(MS2000_HEADERS
     source/core/h8s2350_emulator.h
     source/core/h8s2350_memory_map.h
     source/core/h8s2350_instructions.h
+    source/core/h8sjit/mcu_jit.h
     source/core/h8s2350_interrupt_system.h
     source/core/h8s2350_peripherals.h
     source/core/vector_table_tracker.h

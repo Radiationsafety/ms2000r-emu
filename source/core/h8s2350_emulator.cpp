@@ -149,6 +149,25 @@ static inline void setVectorBE32(H8S2350Emulator* cpu, uint32_t vbr, uint8_t vec
 
 // ==== Constructor and Destructor ====
 
+// JIT-0 (2026-10-20): MS2K_MCUJIT turns on the MCU JIT (single-instruction blocks that call back
+// into the interpreter's lean body - see source/core/h8sjit/mcu_jit.h). Off by default.
+// MS2K_JITSTRICT=1 prints why the JIT stood down when an observer or replay mode suppressed it.
+static bool ms2kJitEnabled()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("MS2K_MCUJIT");
+        const bool want = e && *e && std::strcmp(e, "0") != 0 && std::strcmp(e, "off") != 0;
+        if (want) printf("[MCUJIT] MS2K_MCUJIT=%s: JIT-0 single-instruction blocks (EXPERIMENT)\n", e);
+        return want;
+    }();
+    return on;
+}
+static bool ms2kJitStrict()
+{
+    static const bool on = [] { const char* e = std::getenv("MS2K_JITSTRICT"); return e && *e && *e != '0'; }();
+    return on;
+}
+
 H8S2350Emulator::H8S2350Emulator()
     : m_registers{}
     , m_flags{}
@@ -195,6 +214,7 @@ H8S2350Emulator::H8S2350Emulator()
     , m_trace_cpu_always(false)  // Will be set by --trace-cpu=always flag
     , m_quietBoot(false)  // FIX21: Suppress per-instruction verbose trace for fast boot
 {
+    if (ms2kJitEnabled()) m_mcuJit = std::make_unique<ms2k::mcujit::McuJit>();   // JIT-0 (MS2K_MCUJIT)
     printf("[DEBUG] 🚀 H8S2350Emulator constructor called\n");
     // Initialize memory arrays to zero (updated based on MS2000 schematic page 14)
     m_flash_rom.resize(H8S2350MemoryMap::FLASH_SIZE, 0xFF);     // 1 MB Flash (MBM29LV800B)
@@ -379,6 +399,7 @@ H8S2350Emulator::~H8S2350Emulator()
 void H8S2350Emulator::reset()
 {
     ++m_dcacheGen;   // PERF-133
+    ++m_jitGen; assert(m_jitGen == m_dcacheGen);   // JIT-0: lockstep with the decode cache
     std::cout << "Resetting H8S/2350 Emulator..." << std::endl;
     printf("[DEBUG] 🔄 H8S2350Emulator::reset() called\n");
     
@@ -2377,7 +2398,7 @@ void H8S2350Emulator::writeByte(uint32_t address, uint8_t value)
                 // array (AM29LV800B rendered p.11: the command register occupies no address).
                 // A BYTE store is a byte-lane bus cycle; word stores are intercepted in
                 // writeWord() so that one MOV.W is one cycle, as on the x16 bus.
-                if (m_flash_harness_depth > 0) { ++m_dcacheGen; m_insnRawOn = false; m_flash_rom[offset] = value; return; }   // PERF-133
+                if (m_flash_harness_depth > 0) { ++m_dcacheGen; ++m_jitGen; assert(m_jitGen == m_dcacheGen); m_insnRawOn = false; m_flash_rom[offset] = value; return; }   // PERF-133 / JIT-0 lockstep
                 flashBusCycle(offset, value, 1);
                 return;
             }
@@ -2465,6 +2486,7 @@ void H8S2350Emulator::writeByte(uint32_t address, uint8_t value)
 void H8S2350Emulator::flashBusCycle(uint32_t address, uint16_t data, int width)
 {
     ++m_dcacheGen;   // PERF-133: any flash bus write may change what a fetch reads (array or mode)
+    ++m_jitGen; assert(m_jitGen == m_dcacheGen);   // JIT-0: lockstep with the decode cache
     m_insnRawOn = false;   // PERF-MCU-1
     address &= 0x000FFFFFu;
     uint16_t bus = data;
@@ -6506,9 +6528,43 @@ void H8S2350Emulator::executeInstructionFast()
     const uint32_t pc0 = m_registers.pc;
     if (!g_ms2kFastExecEnv || m_trace || m_trace_cpu_always || !m_quietBoot || (pc0 & 1u)
         || !((pc0 >= 0x400u && pc0 < 0xF0000u) || (pc0 >= 0x400000u && pc0 < 0x480000u))) {
+        if (m_mcuJit && ms2kJitStrict()) { static bool once = false;
+            if (!once) { once = true;
+                printf("[MCUJIT] full-path: fastenv=%d trace=%d quiet=%d oddpc=%d map=%d pc=%06X\n",
+                       int(g_ms2kFastExecEnv), int(m_trace), int(m_quietBoot), int(pc0 & 1u),
+                       int(((pc0 >= 0x400u && pc0 < 0xF0000u) || (pc0 >= 0x400000u && pc0 < 0x480000u))), pc0);
+                fflush(stdout); } }
         executeInstruction();
         return;
     }
+    // JIT-0 (2026-10-20, MS2K_MCUJIT): one native block per hot PC, and the block does nothing
+    // but call back into executeInstructionFastBody() below - the SAME lean body the interpreter
+    // takes here. That is the point: it exercises the compile pipeline, the C ABI bridge and the
+    // (pc, m_jitGen, pageGen) invalidation against the real firmware before JIT-1 emits semantics.
+    // Stood down for replay (records per-instruction state) and the opcode histogram (counts
+    // dispatches, and a block bypasses this function's accounting view of them); the decode
+    // cache's tables must be initialised first, since the block key reads m_dramPageGen.
+    if (m_mcuJit) {
+        if (m_replay_mode || g_ms2kOpHist || m_dcache.empty()) {
+            if (ms2kJitStrict()) {
+                static bool once = false;
+                if (!once) { once = true;
+                    printf("[MCUJIT] suppressed: replay=%d ophist=%d dcache_init=%d\n",
+                           int(m_replay_mode), int(g_ms2kOpHist), int(!m_dcache.empty()));
+                    fflush(stdout);
+                }
+            }
+        } else {
+            const uint32_t pgen = pc0 >= 0x400000u ? m_dramPageGen[(pc0 - 0x400000u) >> 8] : 0u;
+            if (m_mcuJit->run(this, pc0, m_jitGen, pgen)) return;
+        }
+    }
+    executeInstructionFastBody();
+}
+
+void H8S2350Emulator::executeInstructionFastBody()
+{
+    const uint32_t pc0 = m_registers.pc;
     // PERF-MCU-9: decodeCached()'s hit path in place (same tests - this PC is flash or DRAM by the gate above -
     // and the same members set); a miss, or anything decodeCached() would not cache, goes through it.
     const H8S2350Instruction* ip = nullptr;
