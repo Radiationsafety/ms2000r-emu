@@ -1236,6 +1236,7 @@ private:
     // Blocks are keyed (pc, m_jitGen, m_dramPageGen[page]) - the same key as DecodeCacheEntry.
     uint32_t m_jitGen = 1;
     std::unique_ptr<ms2k::mcujit::McuJit> m_mcuJit;   // null unless MS2K_MCUJIT (built in ctor)
+    ms2k::mcujit::JitView m_jitView;                 // JIT-1: the address table the blocks read
     // Returns a reference that stays valid until the next decodeCached() call (the executor gets
     // it as the const& it always took; nothing decodes again while an instruction executes).
     const H8S2350Instruction& decodeCached(uint32_t pc);
@@ -1808,6 +1809,7 @@ private:
     struct MidiSched { uint64_t atCycle = 0; std::vector<uint8_t> bytes; };
     std::vector<MidiSched> m_midiSched;    // MS2K_MIDIIN
     size_t   m_midiSchedIdx = 0;
+    size_t   m_midiSchedEnd = 0;           // JIT-1: mirror of m_midiSched.size(), a scalar the blocks can read
 public:
     // Host MIDI IN (e.g. a MIDI port callback). Thread-safe; bytes go onto the MIDI IN line and
     // reach the firmware through SCI1's receiver at MIDI speed.
@@ -2043,7 +2045,18 @@ private:
     void executeInstructionFastBody();   // JIT-0: the fast path minus its entry gate - what a JIT block runs back
 public:
     void mcuJitExecOne() { executeInstructionFastBody(); }   // JIT-0: the thunk's entry point (one instruction)
+    // JIT-1 (MS2K_MCUJIT, Tier-1a): the block builder's whole view of the emulator. jitScan
+    // classifies one PC (the lean body's own decodeCached + fusedKind, so the same truth);
+    // jitFillView pins the live addresses an emitted block addresses through; the three tails
+    // are the interpreter's own code, called exactly as the interpreter would run them.
+    bool jitTier1StaticOk() const;
+    bool jitScan(uint32_t pc, ms2k::mcujit::JitInsnDesc& out);
+    int jitScanWhy() const { return m_jitScanWhy; }   // last jitScan rejection code (MS2K_JITSTRICT)
+    void jitFillView(ms2k::mcujit::JitView& v);
+    void jitCommitTick(uint32_t cycles) { tickPeripherals(cycles); addCycles(cycles); }
+    void jitDiag1000();
 private:
+    int m_jitScanWhy = 0;
     bool m_spUnderflowReported = false;
     void handleInterrupt(H8S2350Interrupt interrupt);
     void updateFlags();

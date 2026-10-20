@@ -751,6 +751,12 @@ bool ms2kEProbe()
 // ---------------------------------------------------------------------------
 uint64_t g_ms2kInsnIndex = 0;   // TRIAD: instructions retired, for probe correlation
 
+// JIT-1 (MS2K_MCUJIT): the step()'s 1-in-1000 diag counter, hoisted from a function-local static
+// so an emitted block can keep it per instruction - one Tier-1a block of k instructions must be
+// observably k interpreter steps, and the diag wrap fires at the same instruction either way.
+// The wrap's two g_diag calls run through jitDiag1000(), the interpreter's own code.
+uint32_t g_ms2kDiagCounter = 0;
+
 // ---------------------------------------------------------------------------
 // TPG TICK RATE (2026-09-19). MS2K_TPGTICK=insn
 //
@@ -1267,7 +1273,7 @@ void H8S2350Emulator::step()
     }
     static uint32_t step_50k = 50000;   // PERF-135: a countdown instead of a division per instruction
     static bool irq_masked_logged = false;     // PERF-MCU-8: these four were declared further down; hoisted so the
-    static uint32_t diag_counter = 0;
+    // JIT-1: diag_counter moved to file scope (g_ms2kDiagCounter) so JIT blocks can keep it.
     if (--step_50k == 0) {
         step_50k = 50000;
         if (ms2kBootDiag()) printf("[DEBUG] Step count: %u, PC=0x%06X\n", step_count, m_registers.pc);   // PERF-129
@@ -1313,7 +1319,7 @@ void H8S2350Emulator::step()
         if (m_replay_mode) syncReplay();
         if (m_clock_cycles_per_step > 1) updateClockSystem();
         if (step_count == 1) checkKickStart();
-        if (++diag_counter == 1000) { diag_counter = 0;
+        if (++g_ms2kDiagCounter == 1000) { g_ms2kDiagCounter = 0;
             g_diag.setCpuFlags((m_registers.exr & 0x80) ? 1 : 0, (m_registers.ccr & 0x80) ? 1 : 0);
             g_diag.setIrqInService(m_irq_in_service);
         }
@@ -1614,7 +1620,7 @@ void H8S2350Emulator::step()
 
     }
     // i17.txt: Update CPU flag diagnostics periodically
-    if (++diag_counter == 1000) { diag_counter = 0; // Every 1000 steps (PERF-135: no division)
+    if (++g_ms2kDiagCounter == 1000) { g_ms2kDiagCounter = 0; // Every 1000 steps (PERF-135: no division)
         uint8_t exrI = (m_registers.exr & 0x80) ? 1 : 0;  // EXR.I bit 7
         uint8_t ccrI = (m_registers.ccr & 0x80) ? 1 : 0;  // CCR.I bit 7
         g_diag.setCpuFlags(exrI, ccrI);
@@ -4021,6 +4027,7 @@ void H8S2350Emulator::sci1RxStep(uint32_t cycles)
                 pos = semi + 1;
             }
             printf("[MIDI-IN] %zu scheduled messages from MS2K_MIDIIN\n", m_midiSched.size());
+            m_midiSchedEnd = m_midiSched.size();   // JIT-1: the scalar mirror the blocks compare against
         }
     }
     while (m_midiSchedIdx < m_midiSched.size() && m_cycles >= m_midiSched[m_midiSchedIdx].atCycle) {
@@ -6709,6 +6716,122 @@ void H8S2350Emulator::executeInstructionFastBody()
         tickPeripherals(cycles);
     }
     addCycles(cycles);
+}
+
+// ===================================================================
+// JIT-1 (2026-10-20, MS2K_MCUJIT): the emulator side of the Tier-1a block builder. Everything
+// the emitter needs is answered here, through the interpreter's OWN code paths, so a compiled
+// block cannot disagree with the body about what an instruction is or what it costs:
+//   jitScan       - decodeCached()/fusedKind()/fetchExtraStates(), the same calls the lean body
+//                   makes at this PC. Only FK_NOP / FK_BCC8 / FK_BCC16 qualify; FK_CALL, FK_NONE,
+//                   an uncached decode (harness read-cb, dcache off, flash not READ_ARRAY) and an
+//                   out-of-map PC all end the block, they do not fail it.
+//   jitFillView   - the live addresses the emitted code reads/writes, plus the function-pointer
+//                   tails (the interpreter's own tickPeripherals+addCycles, the diag-1000 calls,
+//                   ms2kCcTake). Layout assumptions the blocks make (shared_ptr's first word,
+//                   atomic<bool> == bool) are checked here, and v.tier1 turns the multi-instruction
+//                   emitter off if either does not hold.
+//   jitTier1StaticOk - the env switches whose per-instruction work the block would silently skip
+//                   (the coverage recorder, the bus-data recorder); with any of them on, blocks
+//                   stay JIT-0's one-instruction thunk.
+// ===================================================================
+bool H8S2350Emulator::jitTier1StaticOk() const
+{
+    return g_ms2kPeriphBatch && !g_ms2kFusedOff && !g_ms2kBusData && !g_ms2kOpCov;
+}
+
+bool H8S2350Emulator::jitScan(uint32_t pc, ms2k::mcujit::JitInsnDesc& out)
+{
+    m_jitScanWhy = 0;
+    if ((pc & 1u) || !((pc >= 0x400u && pc < 0xF0000u) || (pc >= 0x400000u && pc < 0x480000u)))
+        { m_jitScanWhy = 1 | (int(pc) << 8); return false; }
+    const H8S2350Instruction& insn = decodeCached(pc);
+    const uint32_t size = insn.size;
+    if (size != 2 && size != 4 && size != 6 && size != 8 && size != 10)
+        { m_jitScanWhy = 2 | (size << 8); return false; }
+    if (!m_decodeRaw) { m_jitScanWhy = 3; return false; }          // the uncached scratch decode
+    const uint8_t fk = m_decodeFk;
+    if (fk != FK_NOP && fk != FK_BCC8 && fk != FK_BCC16)
+        { m_jitScanWhy = 4 | (fk << 8); return false; }
+    out.pc = pc; out.size = size; out.kind = fk; out.op0 = m_decodeOp0; out.opcode = insn.opcode;
+    uint32_t taken = (pc + size) & 0x00FFFFFFu;
+    if (fk == FK_BCC8) {
+        out.cc = insn.source_operand & 0x0Fu;
+        taken = (pc + 2u + uint32_t(int32_t(int8_t(m_decodeRaw[1])))) & 0x00FFFFFFu;
+    } else if (fk == FK_BCC16) {
+        out.cc = uint32_t(m_decodeRaw[1] >> 4);
+        taken = (pc + 4u + uint32_t(int32_t(int16_t(uint16_t(m_decodeRaw[2]) << 8 | m_decodeRaw[3])))) & 0x00FFFFFFu;
+    } else out.cc = 0;
+    out.pcFall = (pc + size) & 0x00FFFFFFu;
+    out.pcTaken = taken;
+    // The lean body's fused path commits execCycles = insn.baseCycles for all three kinds, and
+    // cycles = baseCycles + the BUG105 fetch surcharge. The surcharge is a pure function of the
+    // four bus-programming registers - constant folded here, guarded there.
+    out.cycles = insn.baseCycles + fetchExtraStates(pc, size, m_decodeOp0);
+    if (out.cycles >= 4096u) { m_jitScanWhy = 5 | (out.cycles << 8); return false; }  // emitter immediates are 12-bit
+    static const bool s_bustimingOff = [] { const char* e = std::getenv("MS2K_BUSTIMING");
+                                            return e && std::string(e) == "off"; }();
+    out.busOff = s_bustimingOff ? 1u : 0u;
+    if (!s_bustimingOff) {
+        out.abwcr = m_io_registers.ABWCR; out.astcr = m_io_registers.ASTCR;
+        out.wcrh  = m_io_registers.WCRH;  out.wcrl  = m_io_registers.WCRL;
+    } else { out.abwcr = out.astcr = out.wcrh = out.wcrl = 0; }
+    return true;
+}
+
+void H8S2350Emulator::jitFillView(ms2k::mcujit::JitView& v)
+{
+    v.cycles = &m_cycles;
+    v.pc = &m_registers.pc;
+    v.r7 = &m_registers.er[7];
+    v.flags = &m_flags;
+    v.insnIndex = &g_ms2kInsnIndex;
+    v.executed = &m_cycles_executed;
+    v.taintCycle = &m_stackTaint.currentCycle;
+    v.perBudget = &m_perBudget;
+    v.perPend = &m_perPend;
+    v.irqPending = &m_irqPendingCount;
+    v.dmacFast = &m_perDmacFast;
+    v.dmacAcc = &m_dmac_pace_accum;
+    v.peripheral = &m_peripheral;
+    v.sciScr = &m_sci[0].SCR;
+    v.sciSsr = &m_sci[0].SSR;
+    v.midiIdx = &m_midiSchedIdx;
+    v.midiEnd = &m_midiSchedEnd;
+    v.midiHostPending = reinterpret_cast<uint8_t*>(&m_midiInHostPending);
+    v.abwcr = &m_io_registers.ABWCR; v.astcr = &m_io_registers.ASTCR;
+    v.wcrh  = &m_io_registers.WCRH;  v.wcrl  = &m_io_registers.WCRL;
+    v.abwcrVal = m_io_registers.ABWCR; v.astcrVal = m_io_registers.ASTCR;
+    v.wcrhVal  = m_io_registers.WCRH;  v.wcrlVal  = m_io_registers.WCRL;
+    v.quietBootVal = ::g_h8s_quiet_boot ? uint8_t(1) : uint8_t(0);
+    v.quietBoot = reinterpret_cast<uint8_t*>(&::g_h8s_quiet_boot);
+    v.clockStep = &m_clock_cycles_per_step;
+    v.spReported = &m_spUnderflowReported;
+    v.lastExec = &m_last_exec;
+    v.leStart = uint32_t(offsetof(LastExec, start));
+    v.lePc    = uint32_t(offsetof(LastExec, pc));
+    v.leSize  = uint32_t(offsetof(LastExec, size));
+    v.lePrimary = uint32_t(offsetof(LastExec, primary));
+    v.diagCounter = &g_ms2kDiagCounter;
+    v.handoff = [](void* c) noexcept { static_cast<H8S2350Emulator*>(c)->mcuJitExecOne(); };
+    v.commitTick = [](void* c, uint32_t cyc) noexcept { static_cast<H8S2350Emulator*>(c)->jitCommitTick(cyc); };
+    v.diag1000 = [](void* c) noexcept { static_cast<H8S2350Emulator*>(c)->jitDiag1000(); };
+    v.ccTake = [](const void* f, uint32_t cc) noexcept -> int {
+        return ms2kCcTake(*static_cast<const H8SFlags*>(f), cc) ? 1 : 0;
+    };
+    // The two layout assumptions the emitted code cannot re-test for itself: the shared_ptr's
+    // first word must be its object pointer (the batch predicate reads it as one load), and the
+    // atomic<bool> the predicate loads must be a plain byte. Either failing: stay at JIT-0.
+    void* firstWord = *reinterpret_cast<void**>(&m_peripheral);
+    v.tier1 = (firstWord == static_cast<void*>(m_peripheral.get()))
+              && sizeof(std::atomic<bool>) == sizeof(bool);
+}
+
+void H8S2350Emulator::jitDiag1000()
+{
+    // exactly the step() tail's two calls
+    g_diag.setCpuFlags((m_registers.exr & 0x80) ? 1 : 0, (m_registers.ccr & 0x80) ? 1 : 0);
+    g_diag.setIrqInService(m_irq_in_service);
 }
 
 void H8S2350Emulator::executeInstruction()
